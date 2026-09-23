@@ -35,10 +35,10 @@ fn add_feed(feeds: &mut Vec<OpmlFeed>, url: &str, title: Option<String>, folder:
             feeds.last_mut().expect("just pushed")
         }
     };
-    if let Some(folder) = folder {
-        if !feed.folders.iter().any(|f| f == folder) {
-            feed.folders.push(folder.to_owned());
-        }
+    if let Some(folder) = folder
+        && !feed.folders.iter().any(|f| f == folder)
+    {
+        feed.folders.push(folder.to_owned());
     }
 }
 

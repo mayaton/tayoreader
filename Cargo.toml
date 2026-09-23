@@ -5,7 +5,7 @@ members = ["crates/tayoreader-core", "crates/tayoreader-cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [workspace.dependencies]
 anyhow = "1.0.104"

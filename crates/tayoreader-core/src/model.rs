@@ -1,0 +1,65 @@
+//! core が扱うデータ型。
+
+/// 購読中のフィード。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Feed {
+    pub id: i64,
+    pub url: String,
+    pub title: Option<String>,
+    pub site_url: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub last_fetched_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    /// 所属フォルダ名（名前順）。
+    pub folders: Vec<String>,
+}
+
+/// 取得結果から得たフィードのメタ情報。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeedMeta {
+    pub title: Option<String>,
+    pub site_url: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+/// 保存前の記事。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewEntry {
+    pub guid: String,
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub summary: Option<String>,
+    pub content: Option<String>,
+    pub published_at: Option<i64>,
+}
+
+/// 保存済みの記事。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub id: i64,
+    pub feed_id: i64,
+    pub guid: String,
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub summary: Option<String>,
+    pub content: Option<String>,
+    pub published_at: Option<i64>,
+    pub fetched_at: i64,
+    pub is_read: bool,
+    pub is_starred: bool,
+}
+
+/// 記事一覧の絞り込み条件。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EntryFilter {
+    pub unread_only: bool,
+    pub starred_only: bool,
+    pub feed_id: Option<i64>,
+    pub folder: Option<String>,
+    pub limit: Option<u32>,
+}

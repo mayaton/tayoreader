@@ -4,7 +4,7 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { api, errorMessage, onMenuImportOpml, onRefreshProgress } from "./lib/api";
   import { actionFor, type Action } from "./lib/keyboard";
-  import { AUTO_REFRESH_MINUTES, Reader } from "./lib/stores.svelte";
+  import { AUTO_REFRESH_MINUTES, Reader, markAllReadMessage } from "./lib/stores.svelte";
   import AddFeedDialog from "./components/AddFeedDialog.svelte";
   import ArticleView from "./components/ArticleView.svelte";
   import EntryList from "./components/EntryList.svelte";
@@ -13,6 +13,7 @@
 
   const reader = new Reader(api);
   let articlePane: HTMLElement | undefined = $state();
+  let searchInput: HTMLInputElement | undefined = $state();
 
   // プラグイン呼び出しなどの失敗をトーストに出す。
   async function guard(task: () => Promise<unknown>): Promise<void> {
@@ -44,7 +45,7 @@
       reader.toast("info", "更新中はすべて既読にできません");
       return;
     }
-    const ok = await ask("表示中の記事をすべて既読にしますか？", {
+    const ok = await ask(markAllReadMessage(reader.query, reader.searchCount), {
       title: "すべて既読にする",
       kind: "warning",
       okLabel: "既読にする",
@@ -80,6 +81,19 @@
     addFeed: async () => (reader.addDialogOpen = true),
     markAllRead: confirmMarkAllRead,
     closeDialog: async () => (reader.addDialogOpen = false),
+    focusSearch: async () => {
+      searchInput?.focus();
+      searchInput?.select();
+    },
+    // 検索欄から離れ、一覧のキー操作に戻る
+    submitSearch: async () => {
+      searchInput?.blur();
+      await reader.applySearch();
+    },
+    clearSearch: async () => {
+      searchInput?.blur();
+      await reader.clearSearch();
+    },
   };
 
   function onKeydown(event: KeyboardEvent): void {
@@ -90,7 +104,9 @@
         metaKey: event.metaKey,
         ctrlKey: event.ctrlKey,
         altKey: event.altKey,
-        target: event.target as HTMLElement | null,
+        // WebKit は変換を確定する Enter の isComposing が false になるため keyCode 229 も見る
+        composing: event.isComposing || event.keyCode === 229,
+        target: event.target as HTMLInputElement | null,
       },
       { dialogOpen: reader.addDialogOpen },
     );
@@ -127,7 +143,7 @@
 
 <div class="app">
   <Sidebar {reader} />
-  <EntryList {reader} />
+  <EntryList {reader} bind:searchInput />
   <ArticleView {reader} bind:pane={articlePane} />
 </div>
 

@@ -25,6 +25,7 @@ describe("actionFor", () => {
     ["u", "toggleUnreadOnly"],
     ["r", "refresh"],
     ["a", "addFeed"],
+    ["/", "focusSearch"],
     [" ", "scrollDown"],
     ["Escape", "closeDialog"],
   ])("%s → %s", (k, action) => {
@@ -64,6 +65,30 @@ describe("actionFor", () => {
     expect(actionFor(key("j"), open)).toBeNull();
     expect(actionFor(key("A", { shiftKey: true }), open)).toBeNull();
     expect(actionFor(key("Escape"), open)).toBe("closeDialog");
+  });
+
+  it("検索欄では Esc で解除、Enter で検索し、ほかのキーは入力に任せる", () => {
+    const target = { tagName: "INPUT", type: "search" };
+    expect(actionFor(key("Escape", { target }), closed)).toBe("clearSearch");
+    expect(actionFor(key("Enter", { target }), closed)).toBe("submitSearch");
+    expect(actionFor(key("j", { target }), closed)).toBeNull();
+    expect(actionFor(key("/", { target }), closed)).toBeNull();
+    expect(actionFor(key("A", { target, shiftKey: true }), closed)).toBeNull();
+    expect(actionFor(key("Enter", { target, metaKey: true }), closed)).toBeNull();
+  });
+
+  it("ダイアログが開いていれば Esc はダイアログを閉じる", () => {
+    const target = { tagName: "INPUT", type: "search" };
+    expect(actionFor(key("Escape", { target }), { dialogOpen: true })).toBe("closeDialog");
+    expect(actionFor(key("Enter", { target }), { dialogOpen: true })).toBeNull();
+  });
+
+  it("IME の変換中は Enter も Esc も扱わない", () => {
+    for (const target of [{ tagName: "INPUT", type: "search" }, { tagName: "INPUT" }, body]) {
+      expect(actionFor(key("Enter", { target, composing: true }), closed)).toBeNull();
+      expect(actionFor(key("Escape", { target, composing: true }), closed)).toBeNull();
+      expect(actionFor(key("Escape", { target, composing: true }), { dialogOpen: true })).toBeNull();
+    }
   });
 
   it("ボタンにフォーカスがあってもショートカットは効く", () => {

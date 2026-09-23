@@ -1,6 +1,7 @@
 //! TayoReader のコアライブラリ。購読・取得・保存を扱う。
 
 pub mod error;
+pub mod fetch;
 pub mod model;
 pub mod store;
 

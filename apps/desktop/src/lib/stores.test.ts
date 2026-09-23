@@ -1,0 +1,415 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Api, Article, EntrySummary, Selection, SidebarView } from "./api";
+import {
+  PAGE_SIZE,
+  Reader,
+  adjustUnread,
+  refreshMessage,
+  selectionTitle,
+  sidebarItems,
+} from "./stores.svelte";
+
+function entry(id: number, extra: Partial<EntrySummary> = {}): EntrySummary {
+  return {
+    id,
+    feedId: 1,
+    feedTitle: "A",
+    title: `title ${id}`,
+    snippet: "",
+    publishedAt: 1000 - id,
+    isRead: false,
+    isStarred: false,
+    ...extra,
+  };
+}
+
+function article(e: EntrySummary): Article {
+  return {
+    id: e.id,
+    title: e.title,
+    url: `https://a.example/${e.id}`,
+    author: null,
+    feedTitle: e.feedTitle,
+    publishedAt: e.publishedAt,
+    html: "<p>body</p>",
+    isRead: e.isRead,
+    isStarred: e.isStarred,
+  };
+}
+
+// フィード 1（Tech と News）とフィード 2（フォルダなし）。
+function sidebarView(): SidebarView {
+  return {
+    totalUnread: 5,
+    starred: 1,
+    folders: [
+      { name: "News", unread: 3, feeds: [{ id: 1, title: "A", unread: 3, error: null }] },
+      {
+        name: "Tech",
+        unread: 3,
+        feeds: [{ id: 1, title: "A", unread: 3, error: null }],
+      },
+    ],
+    unfiled: [{ id: 2, title: "B", unread: 2, error: null }],
+  };
+}
+
+// DB 代わりの記事配列から一覧を返すモック。
+function mockApi(rows: EntrySummary[]) {
+  const matches = (sel: Selection, unreadOnly: boolean, e: EntrySummary) => {
+    if (sel.kind === "starred") return e.isStarred;
+    return (!unreadOnly || !e.isRead) && (sel.kind !== "feed" || e.feedId === sel.id);
+  };
+  const api = {
+    sidebar: vi.fn(async () => sidebarView()),
+    listEntries: vi.fn(async (sel: Selection, unreadOnly: boolean, offset: number, limit: number) =>
+      rows
+        .filter((e) => matches(sel, unreadOnly, e))
+        .slice(offset, offset + limit)
+        .map((e) => ({ ...e })),
+    ),
+    getArticle: vi.fn(async (id: number) => article(rows.find((e) => e.id === id)!)),
+    setRead: vi.fn(async (ids: number[], read: boolean) => {
+      rows.filter((e) => ids.includes(e.id)).forEach((e) => (e.isRead = read));
+      return ids.length;
+    }),
+    setStarred: vi.fn(async (ids: number[], starred: boolean) => {
+      rows.filter((e) => ids.includes(e.id)).forEach((e) => (e.isStarred = starred));
+      return ids.length;
+    }),
+    markAllRead: vi.fn(async () => {
+      rows.forEach((e) => (e.isRead = true));
+      return rows.length;
+    }),
+    refresh: vi.fn(async () => ({ newEntries: 0, failed: [] as { url: string; message: string }[] })),
+    addFeed: vi.fn(async () => ({ feedId: 9, title: "New", newEntries: 1 })),
+    removeFeed: vi.fn(async () => null),
+    importOpml: vi.fn(async () => ({ added: 3, merged: 1 })),
+    listFolders: vi.fn(async () => ["News", "Tech"]),
+  } satisfies Api;
+  return api;
+}
+
+describe("Reader", () => {
+  let rows: EntrySummary[];
+  let api: ReturnType<typeof mockApi>;
+  let reader: Reader;
+
+  beforeEach(async () => {
+    rows = [entry(1), entry(2), entry(3, { feedId: 2 })];
+    api = mockApi(rows);
+    reader = new Reader(api);
+    await reader.init();
+  });
+
+  it("起動時にサイドバーと未読一覧を読み、記事は自動で選ばない", () => {
+    expect(reader.sidebar?.totalUnread).toBe(5);
+    expect(reader.entries.map((e) => e.id)).toEqual([1, 2, 3]);
+    expect(api.listEntries).toHaveBeenCalledWith({ kind: "all" }, true, 0, PAGE_SIZE);
+    expect(reader.selectedId).toBeNull();
+    expect(reader.article).toBeNull();
+  });
+
+  it("記事を選ぶと本文を読み、既読にして未読数を減らす", async () => {
+    await reader.selectEntry(1);
+    expect(reader.article?.id).toBe(1);
+    expect(api.setRead).toHaveBeenCalledWith([1], true);
+    expect(reader.entries[0].isRead).toBe(true);
+    expect(reader.article?.isRead).toBe(true);
+    const view = reader.sidebar!;
+    expect(view.totalUnread).toBe(4);
+    expect(view.folders.map((f) => f.unread)).toEqual([2, 2]);
+    expect(view.folders[0].feeds[0].unread).toBe(2);
+    expect(view.unfiled[0].unread).toBe(2);
+  });
+
+  it("既読の記事を選んでも set_read を呼ばない", async () => {
+    rows[0].isRead = true;
+    await reader.select({ kind: "all" });
+    await reader.toggleUnreadOnly();
+    await reader.selectEntry(1);
+    expect(api.setRead).not.toHaveBeenCalled();
+  });
+
+  it("連打で後から選んだ記事だけを表示する", async () => {
+    let release!: () => void;
+    const slow = new Promise<void>((r) => (release = r));
+    api.getArticle.mockImplementationOnce(async (id: number) => {
+      await slow;
+      return article(rows.find((e) => e.id === id)!);
+    });
+    const first = reader.selectEntry(1);
+    await reader.selectEntry(2);
+    release();
+    await first;
+    expect(reader.selectedId).toBe(2);
+    expect(reader.article?.id).toBe(2);
+    expect(api.setRead).toHaveBeenCalledTimes(1);
+    expect(api.setRead).toHaveBeenCalledWith([2], true);
+  });
+
+  it("CLI 側で消えた記事を選んだらエラーを出し、画面は壊さない", async () => {
+    api.getArticle.mockRejectedValueOnce({ kind: "NotFound", message: "entry 1 not found" });
+    await reader.selectEntry(1);
+    expect(reader.toasts).toMatchObject([{ kind: "error", message: "entry 1 not found" }]);
+    expect(reader.article).toBeNull();
+    expect(api.setRead).not.toHaveBeenCalled();
+    await reader.next();
+    expect(reader.article?.id).toBe(2);
+  });
+
+  it("未読のみ表示中に既読にした記事は、選択を変えるまで一覧に残す", async () => {
+    await reader.selectEntry(1);
+    await reader.next();
+    expect(reader.entries.map((e) => e.id)).toEqual([1, 2, 3]);
+    expect(reader.selectedId).toBe(2);
+
+    await reader.select({ kind: "all" });
+    expect(reader.entries.map((e) => e.id)).toEqual([3]);
+  });
+
+  it("j / k で前後の記事へ移る。未選択なら先頭を選ぶ", async () => {
+    await reader.next();
+    expect(reader.selectedId).toBe(1);
+    await reader.next();
+    await reader.next();
+    await reader.next();
+    expect(reader.selectedId).toBe(3);
+    await reader.prev();
+    expect(reader.selectedId).toBe(2);
+  });
+
+  it("m で既読・未読を切り替え、未読数も戻す", async () => {
+    await reader.selectEntry(1);
+    await reader.toggleRead();
+    expect(api.setRead).toHaveBeenLastCalledWith([1], false);
+    expect(reader.entries[0].isRead).toBe(false);
+    expect(reader.sidebar?.totalUnread).toBe(5);
+  });
+
+  it("s でスターを切り替え、スター数を動かす", async () => {
+    await reader.selectEntry(1);
+    await reader.toggleStar();
+    expect(api.setStarred).toHaveBeenCalledWith([1], true);
+    expect(reader.entries[0].isStarred).toBe(true);
+    expect(reader.article?.isStarred).toBe(true);
+    expect(reader.sidebar?.starred).toBe(2);
+  });
+
+  it("すべて既読にしても一覧からは消さない", async () => {
+    await reader.markAllRead();
+    expect(api.markAllRead).toHaveBeenCalledWith({ kind: "all" });
+    expect(reader.entries.every((e) => e.isRead)).toBe(true);
+    expect(reader.entries).toHaveLength(3);
+    expect(api.sidebar).toHaveBeenCalledTimes(2);
+  });
+
+  describe("追加読み込み", () => {
+    beforeEach(async () => {
+      rows.splice(0, rows.length, ...Array.from({ length: PAGE_SIZE + 5 }, (_, i) => entry(i + 1)));
+      await reader.select({ kind: "all" });
+    });
+
+    it("200 件ずつ読み、足りなくなったら止める", async () => {
+      expect(reader.entries).toHaveLength(PAGE_SIZE);
+      expect(reader.hasMore).toBe(true);
+      await reader.loadMore();
+      expect(reader.entries).toHaveLength(PAGE_SIZE + 5);
+      expect(reader.hasMore).toBe(false);
+      await reader.loadMore();
+      expect(api.listEntries).toHaveBeenCalledTimes(3);
+    });
+
+    it("一覧に残した既読記事の分だけ offset を減らし、取りこぼさない", async () => {
+      await reader.selectEntry(1);
+      await reader.selectEntry(2);
+      await reader.loadMore();
+      expect(api.listEntries).toHaveBeenLastCalledWith({ kind: "all" }, true, PAGE_SIZE - 2, PAGE_SIZE);
+      const ids = reader.entries.map((e) => e.id);
+      expect(ids).toHaveLength(PAGE_SIZE + 5);
+      expect(new Set(ids).size).toBe(ids.length);
+    });
+
+    it("スター表示中に外した記事は一覧に残し、offset からは除く", async () => {
+      rows.slice(0, PAGE_SIZE + 1).forEach((e) => (e.isStarred = true));
+      await reader.select({ kind: "starred" });
+      expect(api.listEntries).toHaveBeenLastCalledWith({ kind: "starred" }, true, 0, PAGE_SIZE);
+      await reader.selectEntry(1);
+      await reader.toggleStar();
+      expect(reader.entries[0]).toMatchObject({ id: 1, isStarred: false });
+      await reader.loadMore();
+      expect(api.listEntries).toHaveBeenLastCalledWith(
+        { kind: "starred" },
+        true,
+        PAGE_SIZE - 1,
+        PAGE_SIZE,
+      );
+      expect(reader.entries.map((e) => e.id)).toEqual(
+        Array.from({ length: PAGE_SIZE + 1 }, (_, i) => i + 1),
+      );
+    });
+
+    it("末尾で j を押すと次のページを読んで進む", async () => {
+      await reader.selectEntry(PAGE_SIZE);
+      await reader.next();
+      expect(reader.selectedId).toBe(PAGE_SIZE + 1);
+    });
+  });
+
+  describe("更新", () => {
+    it("完了後にサイドバーと一覧を読み直し、選択中の記事は残す", async () => {
+      await reader.selectEntry(1);
+      rows.unshift(entry(0));
+      api.refresh.mockResolvedValueOnce({ newEntries: 1, failed: [] });
+      await reader.refresh();
+      expect(api.sidebar).toHaveBeenCalledTimes(2);
+      // 既読になった 1 は DB 上は未読一覧から外れるが、選択中なので残す
+      expect(reader.entries.map((e) => e.id)).toEqual([0, 1, 2, 3]);
+      expect(reader.selectedId).toBe(1);
+      expect(reader.article?.id).toBe(1);
+      expect(reader.toasts.map((t) => t.message)).toEqual(["1 件の新着"]);
+      expect(reader.refreshing).toBeNull();
+    });
+
+    it("失敗があればエラーのトーストを出す", async () => {
+      api.refresh.mockResolvedValueOnce({
+        newEntries: 2,
+        failed: [{ url: "https://x.example/", message: "request timed out" }],
+      });
+      await reader.refresh();
+      expect(reader.toasts).toMatchObject([{ kind: "error", message: "2 件の新着、1 件のフィードで失敗" }]);
+    });
+
+    it("自動更新（quiet）はトーストを出さない", async () => {
+      api.refresh.mockResolvedValueOnce({ newEntries: 2, failed: [{ url: "u", message: "m" }] });
+      await reader.refresh({ quiet: true });
+      expect(reader.toasts).toEqual([]);
+    });
+
+    it("更新中の再要求は無視し、Busy エラーも表に出さない", async () => {
+      let release!: () => void;
+      api.refresh.mockImplementationOnce(
+        () => new Promise((r) => (release = () => r({ newEntries: 0, failed: [] }))),
+      );
+      const running = reader.refresh({ quiet: true });
+      expect(reader.refreshing).toEqual({ done: 0, total: 0 });
+      reader.onRefreshProgress({ done: 1, total: 3 });
+      expect(reader.refreshing).toEqual({ done: 1, total: 3 });
+      await reader.refresh();
+      expect(api.refresh).toHaveBeenCalledTimes(1);
+      release();
+      await running;
+
+      api.refresh.mockRejectedValueOnce({ kind: "Busy", message: "refresh is already running" });
+      await reader.refresh({ quiet: true });
+      expect(reader.toasts).toEqual([]);
+      reader.onRefreshProgress({ done: 1, total: 1 });
+      expect(reader.refreshing).toBeNull();
+    });
+
+    it("その他のエラーはトーストに出す", async () => {
+      api.refresh.mockRejectedValueOnce({ kind: "Db", message: "database error: locked" });
+      await reader.refresh({ quiet: true });
+      expect(reader.toasts).toMatchObject([{ kind: "error", message: "database error: locked" }]);
+    });
+  });
+
+  describe("購読", () => {
+    it("追加に成功したらダイアログを閉じ、追加したフィードを選ぶ", async () => {
+      reader.addDialogOpen = true;
+      await reader.addFeed("https://new.example/feed", ["Tech"]);
+      expect(api.addFeed).toHaveBeenCalledWith("https://new.example/feed", ["Tech"]);
+      expect(reader.addDialogOpen).toBe(false);
+      expect(reader.selection).toEqual({ kind: "feed", id: 9 });
+    });
+
+    it("追加の失敗は呼び出し元に投げ、ダイアログは閉じない", async () => {
+      reader.addDialogOpen = true;
+      api.addFeed.mockRejectedValueOnce({ kind: "Parse", message: "failed to parse feed: x" });
+      await expect(reader.addFeed("https://bad.example/", [])).rejects.toMatchObject({ kind: "Parse" });
+      expect(reader.addDialogOpen).toBe(true);
+    });
+
+    it("選択中のフィードを解除したら「すべて」に戻る", async () => {
+      await reader.select({ kind: "feed", id: 2 });
+      await reader.removeFeed(2);
+      expect(api.removeFeed).toHaveBeenCalledWith(2);
+      expect(reader.selection).toEqual({ kind: "all" });
+    });
+
+    it("OPML を取り込んだら結果を出して全体を更新する", async () => {
+      await reader.importOpml("/tmp/subs.opml");
+      expect(api.importOpml).toHaveBeenCalledWith("/tmp/subs.opml");
+      expect(reader.toasts[0].message).toBe("3 件を追加、1 件は購読済み");
+      expect(api.refresh).toHaveBeenCalledTimes(1);
+    });
+
+    it("OPML の取り込みに失敗したら更新しない", async () => {
+      api.importOpml.mockRejectedValueOnce({ kind: "Opml", message: "invalid OPML: x" });
+      await reader.importOpml("/tmp/bad.opml");
+      expect(reader.toasts[0]).toMatchObject({ kind: "error", message: "invalid OPML: x" });
+      expect(api.refresh).not.toHaveBeenCalled();
+    });
+  });
+
+  it("] / [ でサイドバーの項目を巡る", async () => {
+    await reader.nextSource();
+    expect(reader.selection).toEqual({ kind: "starred" });
+    await reader.nextSource();
+    expect(reader.selection).toEqual({ kind: "folder", name: "News" });
+    await reader.prevSource();
+    await reader.prevSource();
+    expect(reader.selection).toEqual({ kind: "all" });
+    await reader.prevSource();
+    expect(reader.selection).toEqual({ kind: "all" });
+  });
+
+  it("エラーのトーストは 10 秒で消える", async () => {
+    vi.useFakeTimers();
+    try {
+      reader.toast("error", "boom");
+      vi.advanceTimersByTime(9_999);
+      expect(reader.toasts).toHaveLength(1);
+      vi.advanceTimersByTime(1);
+      expect(reader.toasts).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("純粋関数", () => {
+  it("sidebarItems は複数フォルダのフィードを 1 回だけ並べる", () => {
+    expect(sidebarItems(sidebarView())).toEqual([
+      { kind: "all" },
+      { kind: "starred" },
+      { kind: "folder", name: "News" },
+      { kind: "feed", id: 1 },
+      { kind: "folder", name: "Tech" },
+      { kind: "feed", id: 2 },
+    ]);
+    expect(sidebarItems(null)).toEqual([{ kind: "all" }, { kind: "starred" }]);
+  });
+
+  it("adjustUnread は 0 未満にしない", () => {
+    const view = sidebarView();
+    adjustUnread(view, 2, -5);
+    expect(view.unfiled[0].unread).toBe(0);
+    expect(view.totalUnread).toBe(0);
+    adjustUnread(view, 99, -1);
+    expect(view.totalUnread).toBe(0);
+  });
+
+  it("selectionTitle", () => {
+    const view = sidebarView();
+    expect(selectionTitle(view, { kind: "all" }, true)).toBe("すべての未読");
+    expect(selectionTitle(view, { kind: "all" }, false)).toBe("すべての記事");
+    expect(selectionTitle(view, { kind: "starred" }, true)).toBe("スター");
+    expect(selectionTitle(view, { kind: "folder", name: "Tech" }, true)).toBe("Tech");
+    expect(selectionTitle(view, { kind: "feed", id: 2 }, true)).toBe("B");
+  });
+
+  it("refreshMessage", () => {
+    expect(refreshMessage({ newEntries: 0, failed: [] })).toBe("0 件の新着");
+  });
+});

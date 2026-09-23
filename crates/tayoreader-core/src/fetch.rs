@@ -83,7 +83,11 @@ fn header_value(response: &reqwest::Response, name: header::HeaderName) -> Optio
 
 /// フィード本文（RSS / Atom / JSON Feed）をパースする。`meta` の etag / last_modified は空。
 pub fn parse_feed(body: &[u8]) -> Result<(FeedMeta, Vec<NewEntry>)> {
-    let feed = feed_rs::parser::parse(body).map_err(|e| Error::Parse(e.to_string()))?;
+    let feed = feed_rs::parser::Builder::new()
+        .id_generator(|_, _, _| String::new())
+        .build()
+        .parse(body)
+        .map_err(|e| Error::Parse(e.to_string()))?;
     let meta = FeedMeta {
         title: feed.title.map(|t| t.content),
         site_url: alternate_link(&feed.links),
@@ -192,6 +196,33 @@ mod tests {
         assert_eq!(hashed.len(), 64);
         assert_eq!(hashed, entry_guid("", Some(""), Some("t"), Some(1)));
         assert_ne!(hashed, entry_guid("", None, Some("t"), Some(2)));
+    }
+
+    const RSS_NO_GUID_NO_LINK: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Example Blog</title>
+    <link>https://example.com/</link>
+    <description>An example feed</description>
+    <item>
+      <title>Guidless post</title>
+      <pubDate>Wed, 02 Sep 2026 09:00:00 +0000</pubDate>
+      <description>Summary of the guidless post</description>
+    </item>
+  </channel>
+</rss>"#;
+
+    #[test]
+    fn guid_is_stable_hash_when_id_and_link_are_absent() {
+        let (_, entries1) = parse_feed(RSS_NO_GUID_NO_LINK.as_bytes()).unwrap();
+        let (_, entries2) = parse_feed(RSS_NO_GUID_NO_LINK.as_bytes()).unwrap();
+        assert_eq!(entries1.len(), 1);
+        assert_eq!(entries2.len(), 1);
+        let guid1 = &entries1[0].guid;
+        let guid2 = &entries2[0].guid;
+        assert_eq!(guid1, guid2);
+        assert_eq!(guid1.len(), 64);
+        assert!(guid1.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[tokio::test]

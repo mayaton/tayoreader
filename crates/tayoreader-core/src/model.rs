@@ -65,6 +65,8 @@ pub struct EntryFilter {
     pub folder: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    /// 検索語。空白（全角空白を含む）で区切った語をすべて含む記事に絞る。空白だけなら絞らない。
+    pub query: Option<String>,
 }
 
 /// OPML から読み取ったフィード。`folders` は入れ子の内側のフォルダ名。

@@ -21,6 +21,9 @@ const MIGRATIONS: &[M<'static>] = &[
 /// 検索用テキストの埋め戻しで 1 トランザクションに入れる件数。
 const BACKFILL_BATCH: i64 = 500;
 
+/// trigram の索引で引ける語の最小文字数。これより短い語は LIKE で探す。
+const TRIGRAM_CHARS: usize = 3;
+
 const FEED_COLUMNS: &str =
     "id, url, title, site_url, etag, last_modified, last_fetched_at, last_error, created_at";
 
@@ -348,7 +351,52 @@ fn filter_condition(filter: &EntryFilter) -> (String, Vec<Value>) {
         );
         args.push(folder.clone().into());
     }
+    if let Some(query) = &filter.query {
+        for term in search_terms(query) {
+            if term.chars().count() >= TRIGRAM_CHARS {
+                sql.push_str(
+                    " AND e.id IN (SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?)",
+                );
+                args.push(fts_phrase(term).into());
+            } else {
+                sql.push_str(r" AND (e.title LIKE ? ESCAPE '\' OR e.plain_text LIKE ? ESCAPE '\')");
+                let pattern = like_pattern(term);
+                args.push(pattern.clone().into());
+                args.push(pattern.into());
+            }
+        }
+    }
     (sql, args)
+}
+
+/// 検索語を空白（全角空白を含む）で区切り、重複を除いて返す。
+fn search_terms(query: &str) -> Vec<&str> {
+    let mut terms: Vec<&str> = Vec::new();
+    for term in query.split_whitespace() {
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+/// 語を FTS5 のフレーズにする。演算子（OR、NEAR、* など）として解釈させないため、
+/// 二重引用符で囲み、語中の `"` は `""` にする。
+fn fts_phrase(term: &str) -> String {
+    format!("\"{}\"", term.replace('"', "\"\""))
+}
+
+/// 語を含む LIKE のパターンにする。`\`・`%`・`_` は `\` でエスケープする。
+fn like_pattern(term: &str) -> String {
+    let mut pattern = String::from("%");
+    for c in term.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern.push('%');
+    pattern
 }
 
 /// v2 より前に保存した記事（`plain_text` が NULL）の検索用テキストを埋め、件数を返す。
@@ -1280,5 +1328,226 @@ mod tests {
         drop(s);
         let reopened = Store::open(&path).unwrap();
         assert_eq!(fts_ids(&reopened, "台風情報"), vec![1]);
+    }
+
+    // ---- 検索 ----
+
+    /// フィード a（フォルダ Tech）と b の記事 4 件。新しい順に b2, a2, b1, a1。
+    fn search_store() -> (Store, i64, i64) {
+        let s = store();
+        let a = s.insert_feed("https://a.example/feed", None, 1).unwrap();
+        let b = s.insert_feed("https://b.example/feed", None, 1).unwrap();
+        s.add_feed_to_folder(a, "Tech").unwrap();
+        let at = |mut e: NewEntry, published_at| {
+            e.published_at = Some(published_at);
+            e
+        };
+        s.save_fetched(
+            a,
+            &FeedMeta::default(),
+            &[
+                at(
+                    article(
+                        "a1",
+                        "台風情報 2026",
+                        Some("<p>台風が近づいています</p>"),
+                        Some(r#"<p>進路は<a href="https://secret.example/">詳細</a>を参照</p>"#),
+                    ),
+                    10,
+                ),
+                at(
+                    article(
+                        "a2",
+                        "Rust 1.97 release",
+                        None,
+                        Some(r"<p>New <b>release</b> of Rust. 100% safe_code C:\path</p>"),
+                    ),
+                    30,
+                ),
+            ],
+            100,
+        )
+        .unwrap();
+        s.save_fetched(
+            b,
+            &FeedMeta::default(),
+            &[
+                at(
+                    article(
+                        "b1",
+                        "今日の天気",
+                        Some("<p>晴れ。台風の心配なし。</p>"),
+                        None,
+                    ),
+                    20,
+                ),
+                at(
+                    article(
+                        "b2",
+                        "記号の記事",
+                        Some(r#"<p>a"b と OR と NEAR(x) と c* と title:foo と C++</p>"#),
+                        None,
+                    ),
+                    40,
+                ),
+            ],
+            100,
+        )
+        .unwrap();
+        (s, a, b)
+    }
+
+    fn search(query: &str) -> EntryFilter {
+        EntryFilter {
+            query: Some(query.into()),
+            ..Default::default()
+        }
+    }
+
+    fn guids(s: &Store, filter: &EntryFilter) -> Vec<String> {
+        s.list_entries(filter)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.guid)
+            .collect()
+    }
+
+    #[test]
+    fn search_finds_japanese_and_english_ignoring_case() {
+        let (s, _, _) = search_store();
+        assert_eq!(guids(&s, &search("台風情報")), vec!["a1"]);
+        assert_eq!(guids(&s, &search("近づいて")), vec!["a1"]);
+        assert_eq!(guids(&s, &search("release")), vec!["a2"]);
+        assert_eq!(guids(&s, &search("RUST")), vec!["a2"]);
+        assert!(guids(&s, &search("存在しない語")).is_empty());
+    }
+
+    #[test]
+    fn search_ignores_text_inside_tags() {
+        let (s, _, _) = search_store();
+        assert!(guids(&s, &search("secret")).is_empty());
+        assert!(guids(&s, &search("href")).is_empty());
+        assert_eq!(guids(&s, &search("詳細")), vec!["a1"]);
+    }
+
+    #[test]
+    fn short_terms_are_found_with_like() {
+        let (s, _, _) = search_store();
+        assert_eq!(guids(&s, &search("台風")), vec!["b1", "a1"]);
+        assert_eq!(guids(&s, &search("晴")), vec!["b1"]);
+        // LIKE も ASCII は大文字小文字を区別しない
+        assert_eq!(guids(&s, &search("c+")), vec!["b2"]);
+    }
+
+    #[test]
+    fn like_wildcards_in_short_terms_are_literal() {
+        let (s, _, _) = search_store();
+        assert_eq!(guids(&s, &search("%")), vec!["a2"]);
+        assert_eq!(guids(&s, &search("_")), vec!["a2"]);
+        assert_eq!(guids(&s, &search(r"\")), vec!["a2"]);
+        assert_eq!(guids(&s, &search("0%")), vec!["a2"]);
+    }
+
+    #[test]
+    fn all_terms_must_match() {
+        let (s, _, _) = search_store();
+        assert_eq!(guids(&s, &search("台風 情報")), vec!["a1"]);
+        assert_eq!(guids(&s, &search("台風 心配")), vec!["b1"]);
+        // 全角空白でも区切る。同じ語の重複は 1 つとして扱う
+        assert_eq!(guids(&s, &search("台風　心配 台風")), vec!["b1"]);
+        assert_eq!(guids(&s, &search("  Rust   release ")), vec!["a2"]);
+        assert!(guids(&s, &search("台風情報 心配")).is_empty());
+    }
+
+    #[test]
+    fn fts_operators_and_quotes_are_literal() {
+        let (s, _, _) = search_store();
+        for query in [
+            r#"a"b"#,
+            r#"""#,
+            "OR",
+            "NEAR",
+            "NEAR(x)",
+            "c*",
+            "title:foo",
+            "C++",
+        ] {
+            assert_eq!(guids(&s, &search(query)), vec!["b2"], "{query}");
+        }
+    }
+
+    #[test]
+    fn blank_query_does_not_filter() {
+        let (s, _, _) = search_store();
+        for query in ["", "   ", "　 　"] {
+            assert_eq!(s.count_entries(&search(query)).unwrap(), 4, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn search_combines_with_other_filters() {
+        let (s, a, b) = search_store();
+        let with = |filter: EntryFilter| {
+            guids(
+                &s,
+                &EntryFilter {
+                    query: Some("台風".into()),
+                    ..filter
+                },
+            )
+        };
+        assert_eq!(with(filter_by_feed(b)), vec!["b1"]);
+        assert_eq!(
+            with(EntryFilter {
+                folder: Some("Tech".into()),
+                ..Default::default()
+            }),
+            vec!["a1"]
+        );
+        assert_eq!(
+            with(EntryFilter {
+                limit: Some(1),
+                offset: Some(1),
+                ..Default::default()
+            }),
+            vec!["a1"]
+        );
+
+        let a1 = s.list_entries(&filter_by_feed(a)).unwrap()[1].id;
+        s.set_starred(&[a1], true).unwrap();
+        assert_eq!(
+            with(EntryFilter {
+                starred_only: true,
+                ..Default::default()
+            }),
+            vec!["a1"]
+        );
+        let b1 = s.list_entries(&filter_by_feed(b)).unwrap()[1].id;
+        s.set_read(&[b1], true).unwrap();
+        assert_eq!(
+            with(EntryFilter {
+                unread_only: true,
+                ..Default::default()
+            }),
+            vec!["a1"]
+        );
+    }
+
+    #[test]
+    fn count_and_mark_all_read_use_query() {
+        let (s, _, _) = search_store();
+        assert_eq!(s.count_entries(&search("台風")).unwrap(), 2);
+        assert_eq!(s.count_entries(&search("release")).unwrap(), 1);
+        assert_eq!(s.mark_all_read(&search("台風")).unwrap(), 2);
+        let unread = s
+            .list_entries(&EntryFilter {
+                unread_only: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            unread.iter().map(|e| e.guid.as_str()).collect::<Vec<_>>(),
+            vec!["b2", "a2"]
+        );
     }
 }

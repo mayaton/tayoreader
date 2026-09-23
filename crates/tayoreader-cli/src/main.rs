@@ -152,6 +152,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 folder,
                 limit: Some(limit),
                 offset: None,
+                query: None,
             };
             for entry in store.list_entries(&filter)? {
                 print_entry(&entry);

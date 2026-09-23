@@ -3,6 +3,8 @@ all-features = false
 no-default-features = false
 
 [advisories]
+# tauri が間接的に使う unmaintained な crate（unic-* など）は差し替えられないため、直接依存だけを見る
+unmaintained = "workspace"
 ignore = []
 
 [licenses]

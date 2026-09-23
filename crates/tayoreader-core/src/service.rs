@@ -1,6 +1,7 @@
 //! 保存と取得を組み合わせたユースケース。CLI と UI はここを入口にする。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::stream::{self, StreamExt};
 
@@ -111,14 +112,30 @@ impl Service {
     /// フィード単位の取得失敗は `RefreshOutcome::Failed` に積んで続行する。
     /// `Err` になるのは DB の失敗と、指定した `feed_id` が無い場合だけ。
     pub async fn refresh(&self, feed_id: Option<i64>) -> Result<RefreshReport> {
+        self.refresh_with_progress(feed_id, |_, _| {}).await
+    }
+
+    /// `refresh` と同じ。1 フィード終わるごとに `on_progress(完了数, 総数)` を呼ぶ。
+    pub async fn refresh_with_progress(
+        &self,
+        feed_id: Option<i64>,
+        on_progress: impl Fn(usize, usize) + Send + Sync,
+    ) -> Result<RefreshReport> {
         let feeds = self
             .blocking(move |s| match feed_id {
                 Some(id) => Ok(vec![s.get_feed(id)?]),
                 None => s.list_feeds(),
             })
             .await?;
+        let total = feeds.len();
+        let done = AtomicUsize::new(0);
+        let (done, on_progress) = (&done, &on_progress);
         let results: Vec<Result<FeedRefresh>> = stream::iter(feeds)
-            .map(|feed| self.refresh_one(feed))
+            .map(|feed| async move {
+                let result = self.refresh_one(feed).await;
+                on_progress(done.fetch_add(1, Ordering::SeqCst) + 1, total);
+                result
+            })
             .buffer_unordered(MAX_CONCURRENT_FETCHES)
             .collect()
             .await;
@@ -385,5 +402,48 @@ mod tests {
                 merged: 4
             }
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_with_progress_reports_each_feed() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            "/ok.xml",
+            ResponseTemplate::new(200).set_body_string(RSS),
+        )
+        .await;
+        serve(&server, "/broken.xml", ResponseTemplate::new(500)).await;
+        let svc = service();
+        for route in ["/ok.xml", "/broken.xml", "/missing.xml"] {
+            svc.store()
+                .insert_feed(&format!("{}{route}", server.uri()), None, 1)
+                .unwrap();
+        }
+
+        let calls = std::sync::Mutex::new(Vec::new());
+        let report = svc
+            .refresh_with_progress(None, |done, total| {
+                calls.lock().unwrap().push((done, total));
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.feeds.len(), 3);
+        let mut calls = calls.into_inner().unwrap();
+        calls.sort();
+        assert_eq!(calls, vec![(1, 3), (2, 3), (3, 3)]);
+    }
+
+    #[tokio::test]
+    async fn refresh_with_progress_without_feeds_never_calls_back() {
+        let called = AtomicUsize::new(0);
+        let report = service()
+            .refresh_with_progress(None, |_, _| {
+                called.fetch_add(1, Ordering::SeqCst);
+            })
+            .await
+            .unwrap();
+        assert!(report.feeds.is_empty());
+        assert_eq!(called.load(Ordering::SeqCst), 0);
     }
 }

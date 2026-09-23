@@ -158,6 +158,19 @@ describe("Reader", () => {
     expect(reader.article?.id).toBe(2);
   });
 
+  it("A を表示中に選び直した B が NotFound で失敗したら、selectedId は B のまま本文だけ消す", async () => {
+    await reader.selectEntry(1);
+    expect(reader.article?.id).toBe(1);
+    api.getArticle.mockRejectedValueOnce({ kind: "NotFound", message: "entry 2 not found" });
+    await reader.selectEntry(2);
+    // selectedId は最新の選択（B）のまま。A の本文を残さず消し、o/Enter が A の URL を開かないようにする
+    expect(reader.selectedId).toBe(2);
+    expect(reader.article).toBeNull();
+    // 未読数がずれている可能性があるのでサイドバーを読み直す（起動時の 1 回 + ここでの 1 回）
+    expect(api.sidebar).toHaveBeenCalledTimes(2);
+    expect(reader.toasts).toMatchObject([{ kind: "error", message: "entry 2 not found" }]);
+  });
+
   it("未読のみ表示中に既読にした記事は、選択を変えるまで一覧に残す", async () => {
     await reader.selectEntry(1);
     await reader.next();
@@ -202,6 +215,23 @@ describe("Reader", () => {
     expect(reader.entries.every((e) => e.isRead)).toBe(true);
     expect(reader.entries).toHaveLength(3);
     expect(api.sidebar).toHaveBeenCalledTimes(2);
+  });
+
+  it("更新中は「すべて既読」を実行せずトーストを出す", async () => {
+    let release!: () => void;
+    api.refresh.mockImplementationOnce(
+      () => new Promise((r) => (release = () => r({ newEntries: 0, failed: [] }))),
+    );
+    const running = reader.refresh({ quiet: true });
+    expect(reader.refreshing).not.toBeNull();
+
+    await reader.markAllRead();
+    expect(api.markAllRead).not.toHaveBeenCalled();
+    expect(reader.entries.every((e) => e.isRead)).toBe(false);
+    expect(reader.toasts).toMatchObject([{ kind: "info", message: "更新中はすべて既読にできません" }]);
+
+    release();
+    await running;
   });
 
   describe("追加読み込み", () => {
@@ -349,6 +379,25 @@ describe("Reader", () => {
       await reader.importOpml("/tmp/bad.opml");
       expect(reader.toasts[0]).toMatchObject({ kind: "error", message: "invalid OPML: x" });
       expect(api.refresh).not.toHaveBeenCalled();
+    });
+
+    it("更新中に OPML を取り込んだら、次回の更新に任せる旨をトーストで出すだけにする", async () => {
+      let release!: () => void;
+      api.refresh.mockImplementationOnce(
+        () => new Promise((r) => (release = () => r({ newEntries: 0, failed: [] }))),
+      );
+      const running = reader.refresh({ quiet: true });
+      expect(reader.refreshing).not.toBeNull();
+
+      await reader.importOpml("/tmp/subs.opml");
+      expect(reader.toasts.map((t) => t.message)).toEqual([
+        "3 件を追加、1 件は購読済み",
+        "更新中のため、追加したフィードは次回の更新で取得されます",
+      ]);
+      expect(api.refresh).toHaveBeenCalledTimes(1);
+
+      release();
+      await running;
     });
   });
 

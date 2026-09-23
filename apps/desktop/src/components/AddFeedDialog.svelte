@@ -9,7 +9,6 @@
   let candidates = $state<string[]>([]);
   let chosen = $state<string[]>([]);
   let newFolder = $state("");
-  let busy = $state(false);
   let error = $state<string | null>(null);
   let input: HTMLInputElement | undefined = $state();
 
@@ -19,16 +18,13 @@
 
   async function submit(event: SubmitEvent): Promise<void> {
     event.preventDefault();
-    if (busy || url.trim() === "") return;
-    busy = true;
+    if (reader.addFeedBusy || url.trim() === "") return;
     error = null;
     const folders = [...new Set([...chosen, newFolder.trim()].filter((f) => f !== ""))];
     try {
       await reader.addFeed(url.trim(), folders);
     } catch (e) {
       error = `購読できませんでした: ${errorMessage(e)}`;
-    } finally {
-      busy = false;
     }
   }
 
@@ -46,7 +42,8 @@
 <div
   class="backdrop"
   role="presentation"
-  onclick={(e) => e.target === e.currentTarget && (reader.addDialogOpen = false)}
+  onclick={(e) =>
+    !reader.addFeedBusy && e.target === e.currentTarget && (reader.addDialogOpen = false)}
 >
   <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="add-feed-title">
     <form onsubmit={submit}>
@@ -79,9 +76,15 @@
       </fieldset>
       {#if error}<p class="error" role="alert">{error}</p>{/if}
       <div class="actions">
-        <button type="button" onclick={() => (reader.addDialogOpen = false)}>キャンセル</button>
-        <button type="submit" class="primary" disabled={busy || url.trim() === ""}>
-          {#if busy}<span class="spinner" aria-hidden="true"></span>取得中…{:else}購読{/if}
+        <button
+          type="button"
+          disabled={reader.addFeedBusy}
+          onclick={() => (reader.addDialogOpen = false)}
+        >
+          キャンセル
+        </button>
+        <button type="submit" class="primary" disabled={reader.addFeedBusy || url.trim() === ""}>
+          {#if reader.addFeedBusy}<span class="spinner" aria-hidden="true"></span>取得中…{:else}購読{/if}
         </button>
       </div>
     </form>

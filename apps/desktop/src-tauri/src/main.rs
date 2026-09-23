@@ -76,8 +76,15 @@ fn open_main_window(app: &AppHandle) -> tauri::Result<()> {
 }
 
 /// アプリ自身の画面の URL か（本番は tauri://localhost、開発時は http://localhost:1420）。
+/// 開発時の localhost 許可はデバッグビルドに限定し、リリースビルドでは tauri:// のみ許可する。
 fn is_app_url(url: &Url) -> bool {
-    url.scheme() == "tauri" || url.host_str() == Some("localhost")
+    if url.scheme() == "tauri" {
+        return true;
+    }
+    cfg!(debug_assertions)
+        && url.scheme() == "http"
+        && url.host_str() == Some("localhost")
+        && url.port() == Some(1420)
 }
 
 fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
@@ -146,6 +153,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
 mod tests {
     use super::*;
 
+    // テストは常にデバッグビルド（cfg(debug_assertions) が真）として実行される。
     #[test]
     fn only_app_urls_are_navigable() {
         let url = |s: &str| Url::parse(s).unwrap();
@@ -153,5 +161,10 @@ mod tests {
         assert!(is_app_url(&url("http://localhost:1420/")));
         assert!(!is_app_url(&url("https://example.com/")));
         assert!(!is_app_url(&url("http://localhost.example.com/")));
+        // devUrl のポート以外は許可しない
+        assert!(!is_app_url(&url("http://localhost:8080/")));
+        assert!(!is_app_url(&url("http://localhost/")));
+        // スキームが http 以外（https）の localhost も許可しない
+        assert!(!is_app_url(&url("https://localhost:1420/")));
     }
 }

@@ -118,6 +118,8 @@ export class Reader {
   refreshing = $state<RefreshProgress | null>(null);
   toasts = $state<Toast[]>([]);
   addDialogOpen = $state(false);
+  // 購読の取得中は true。この間はダイアログを閉じられないようにする（結果を見失わないため）。
+  addFeedBusy = $state(false);
 
   #api: Api;
   #nextToastId = 1;
@@ -205,6 +207,12 @@ export class Reader {
         this.#applyRead(id, true);
       }
     } catch (e) {
+      // このエラーが最新の選択に対応するなら、古い本文を残さず消す
+      if (this.selectedId === id) {
+        this.article = null;
+        // NotFound はサイドバーの未読数が実態とずれている可能性がある
+        if (isCommandError(e) && e.kind === "NotFound") void this.loadSidebar();
+      }
       this.#error(e);
     }
   }
@@ -249,7 +257,12 @@ export class Reader {
   }
 
   // 表示中の一覧をすべて既読にする（一覧からは消さない）。
+  // 更新中は、取り込み中の新着まで既読にしてしまうため実行しない。
   async markAllRead(): Promise<void> {
+    if (this.refreshing) {
+      this.toast("info", "更新中はすべて既読にできません");
+      return;
+    }
     try {
       await this.#api.markAllRead(this.selection);
       this.entries.forEach((e) => (e.isRead = true));
@@ -284,10 +297,15 @@ export class Reader {
 
   // 購読を追加する。失敗は呼び出し元（ダイアログ）に投げる。
   async addFeed(url: string, folders: string[]): Promise<void> {
-    const added = await this.#api.addFeed(url, folders);
-    this.addDialogOpen = false;
-    await this.loadSidebar();
-    await this.select({ kind: "feed", id: added.feedId });
+    this.addFeedBusy = true;
+    try {
+      const added = await this.#api.addFeed(url, folders);
+      this.addDialogOpen = false;
+      await this.loadSidebar();
+      await this.select({ kind: "feed", id: added.feedId });
+    } finally {
+      this.addFeedBusy = false;
+    }
   }
 
   // 購読追加ダイアログのフォルダ候補。
@@ -309,7 +327,8 @@ export class Reader {
     }
   }
 
-  // OPML を取り込み、続けて全体を更新する。
+  // OPML を取り込み、続けて全体を更新する。更新中に取り込んだ場合は割り込ませず、
+  // 次回の更新（自動更新や手動更新）に任せる。
   async importOpml(path: string): Promise<void> {
     try {
       const r = await this.#api.importOpml(path);
@@ -317,6 +336,10 @@ export class Reader {
       await this.loadSidebar();
     } catch (e) {
       this.#error(e);
+      return;
+    }
+    if (this.refreshing) {
+      this.toast("info", "更新中のため、追加したフィードは次回の更新で取得されます");
       return;
     }
     await this.refresh();

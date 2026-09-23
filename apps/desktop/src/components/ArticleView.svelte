@@ -22,7 +22,8 @@
   }
 </script>
 
-<!-- クリックはリンクの委譲処理だけ。リンク自体はキーボードでも操作でき、Enter でも click が届く -->
+<!-- クリックはリンクの委譲処理だけ。リンクにフォーカスした状態の Enter でも click が届くため、
+     App.svelte 側のグローバル Enter ハンドラは target が A タグのときは何もしない -->
 <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
 <article class="article" bind:this={pane} onclick={onLinkClick} onauxclick={onLinkClick}>
   {#if reader.article}

@@ -38,6 +38,12 @@
   }
 
   async function confirmMarkAllRead(): Promise<void> {
+    // 確認ダイアログを開く前にガード。ダイアログ表示中に更新が始まった場合の
+    // 二重チェックは markAllRead 側（reader.refreshing の確認）に任せる。
+    if (reader.refreshing) {
+      reader.toast("info", "更新中はすべて既読にできません");
+      return;
+    }
     const ok = await ask("表示中の記事をすべて既読にしますか？", {
       title: "すべて既読にする",
       kind: "warning",
@@ -89,6 +95,13 @@
       { dialogOpen: reader.addDialogOpen },
     );
     if (!action || (action === "closeDialog" && !reader.addDialogOpen)) return;
+    // 購読取得中はダイアログを閉じさせない（結果を見失わないため）
+    if (action === "closeDialog" && reader.addFeedBusy) return;
+    // 本文中のリンクにフォーカスした状態の Enter は、ブラウザ標準のリンク処理
+    // （ArticleView の click ハンドラ）に任せる。ここで元記事を開くと二重に反応する
+    if (action === "openOriginal" && event.key === "Enter" && (event.target as HTMLElement)?.tagName === "A") {
+      return;
+    }
     event.preventDefault();
     void guard(handlers[action]);
   }

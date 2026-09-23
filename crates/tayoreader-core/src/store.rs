@@ -8,7 +8,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use rusqlite_migration::{M, Migrations};
 
-use crate::model::{Entry, EntryFilter, Feed, FeedMeta, NewEntry};
+use crate::model::{Entry, EntryFilter, Feed, FeedMeta, ImportReport, NewEntry, OpmlFeed};
 use crate::{Error, Result};
 
 const MIGRATIONS: &[M<'static>] = &[M::up(include_str!("../migrations/001_init.sql"))];
@@ -53,24 +53,11 @@ impl Store {
 
     /// フィードを登録して id を返す。URL が登録済みなら `AlreadySubscribed`。
     pub fn insert_feed(&self, url: &str, title: Option<&str>, now: i64) -> Result<i64> {
-        let conn = self.conn();
-        let inserted = conn.execute(
-            "INSERT INTO feeds (url, title, created_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(url) DO NOTHING",
-            params![url, title, now],
-        )?;
-        if inserted == 0 {
-            return Err(Error::AlreadySubscribed(url.to_owned()));
-        }
-        Ok(conn.last_insert_rowid())
+        insert_feed_conn(&self.conn(), url, title, now)
     }
 
     pub fn find_feed_id_by_url(&self, url: &str) -> Result<Option<i64>> {
-        let id = self
-            .conn()
-            .query_row("SELECT id FROM feeds WHERE url = ?1", [url], |r| r.get(0))
-            .optional()?;
-        Ok(id)
+        find_feed_id_by_url_conn(&self.conn(), url)
     }
 
     /// フィードをフォルダに入れる。フォルダが無ければ作り、既に入っていれば何もしない。
@@ -131,63 +118,54 @@ impl Store {
     ) -> Result<usize> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let updated = tx.execute(
-            "UPDATE feeds SET title = COALESCE(?2, title), site_url = COALESCE(?3, site_url),
-                              etag = ?4, last_modified = ?5, last_fetched_at = ?6, last_error = NULL
-             WHERE id = ?1",
-            params![
-                feed_id,
-                meta.title,
-                meta.site_url,
-                meta.etag,
-                meta.last_modified,
-                now
-            ],
-        )?;
-        if updated == 0 {
-            return Err(Error::NotFound(format!("feed {feed_id}")));
+        let inserted = save_fetched_conn(&tx, feed_id, meta, entries, now)?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// フィード登録・フォルダ付与・初回記事の保存を 1 トランザクションで行う。
+    /// 戻り値は `(feed_id, 新規記事数)`。
+    pub fn add_subscription(
+        &self,
+        url: &str,
+        meta: &FeedMeta,
+        folders: &[String],
+        entries: &[NewEntry],
+        now: i64,
+    ) -> Result<(i64, usize)> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let feed_id = insert_feed_conn(&tx, url, meta.title.as_deref(), now)?;
+        for folder in folders {
+            add_feed_to_folder_conn(&tx, feed_id, folder)?;
         }
-        let mut inserted = 0;
-        {
-            let mut insert = tx.prepare(
-                "INSERT INTO entries (feed_id, guid, url, title, author, summary, content, published_at, fetched_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(feed_id, guid) DO NOTHING",
-            )?;
-            let mut update = tx.prepare(
-                "UPDATE entries SET url = ?3, title = ?4, author = ?5, summary = ?6, content = ?7, published_at = ?8
-                 WHERE feed_id = ?1 AND guid = ?2",
-            )?;
-            for e in entries {
-                let added = insert.execute(params![
-                    feed_id,
-                    e.guid,
-                    e.url,
-                    e.title,
-                    e.author,
-                    e.summary,
-                    e.content,
-                    e.published_at,
-                    now
-                ])?;
-                if added == 1 {
-                    inserted += 1;
-                } else {
-                    update.execute(params![
-                        feed_id,
-                        e.guid,
-                        e.url,
-                        e.title,
-                        e.author,
-                        e.summary,
-                        e.content,
-                        e.published_at
-                    ])?;
+        let new_entries = save_fetched_conn(&tx, feed_id, meta, entries, now)?;
+        tx.commit()?;
+        Ok((feed_id, new_entries))
+    }
+
+    /// OPML から購読を取り込む。既存 URL はフォルダだけマージする。1 トランザクションで行う。
+    pub fn import_feeds(&self, feeds: &[OpmlFeed], now: i64) -> Result<ImportReport> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut report = ImportReport::default();
+        for feed in feeds {
+            let feed_id = match find_feed_id_by_url_conn(&tx, &feed.url)? {
+                Some(id) => {
+                    report.merged += 1;
+                    id
                 }
+                None => {
+                    report.added += 1;
+                    insert_feed_conn(&tx, &feed.url, feed.title.as_deref(), now)?
+                }
+            };
+            for folder in &feed.folders {
+                add_feed_to_folder_conn(&tx, feed_id, folder)?;
             }
         }
         tx.commit()?;
-        Ok(inserted)
+        Ok(report)
     }
 
     /// 304 Not Modified を記録する。
@@ -298,6 +276,90 @@ fn entry_from_row(r: &Row<'_>) -> rusqlite::Result<Entry> {
         is_read: r.get(10)?,
         is_starred: r.get(11)?,
     })
+}
+
+fn insert_feed_conn(conn: &Connection, url: &str, title: Option<&str>, now: i64) -> Result<i64> {
+    let inserted = conn.execute(
+        "INSERT INTO feeds (url, title, created_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(url) DO NOTHING",
+        params![url, title, now],
+    )?;
+    if inserted == 0 {
+        return Err(Error::AlreadySubscribed(url.to_owned()));
+    }
+    Ok(conn.last_insert_rowid())
+}
+
+fn find_feed_id_by_url_conn(conn: &Connection, url: &str) -> Result<Option<i64>> {
+    let id = conn
+        .query_row("SELECT id FROM feeds WHERE url = ?1", [url], |r| r.get(0))
+        .optional()?;
+    Ok(id)
+}
+
+fn save_fetched_conn(
+    conn: &Connection,
+    feed_id: i64,
+    meta: &FeedMeta,
+    entries: &[NewEntry],
+    now: i64,
+) -> Result<usize> {
+    let updated = conn.execute(
+        "UPDATE feeds SET title = COALESCE(?2, title), site_url = COALESCE(?3, site_url),
+                          etag = ?4, last_modified = ?5, last_fetched_at = ?6, last_error = NULL
+         WHERE id = ?1",
+        params![
+            feed_id,
+            meta.title,
+            meta.site_url,
+            meta.etag,
+            meta.last_modified,
+            now
+        ],
+    )?;
+    if updated == 0 {
+        return Err(Error::NotFound(format!("feed {feed_id}")));
+    }
+    let mut inserted = 0;
+    {
+        let mut insert = conn.prepare(
+            "INSERT INTO entries (feed_id, guid, url, title, author, summary, content, published_at, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(feed_id, guid) DO NOTHING",
+        )?;
+        let mut update = conn.prepare(
+            "UPDATE entries SET url = ?3, title = ?4, author = ?5, summary = ?6, content = ?7, published_at = ?8
+             WHERE feed_id = ?1 AND guid = ?2",
+        )?;
+        for e in entries {
+            let added = insert.execute(params![
+                feed_id,
+                e.guid,
+                e.url,
+                e.title,
+                e.author,
+                e.summary,
+                e.content,
+                e.published_at,
+                now
+            ])?;
+            if added == 1 {
+                inserted += 1;
+            } else {
+                update.execute(params![
+                    feed_id,
+                    e.guid,
+                    e.url,
+                    e.title,
+                    e.author,
+                    e.summary,
+                    e.content,
+                    e.published_at
+                ])?;
+            }
+        }
+    }
+    Ok(inserted)
 }
 
 /// フォルダ名の前後の空白を取り除く。空になった場合は `Error::InvalidInput`。
@@ -471,6 +533,107 @@ mod tests {
         drop(s);
         let reopened = Store::open(&path).unwrap();
         assert_eq!(reopened.list_feeds().unwrap().len(), 1);
+    }
+
+    // ---- add_subscription / import_feeds ----
+
+    #[test]
+    fn add_subscription_saves_feed_folder_and_entries_in_one_call() {
+        let s = store();
+        let meta = FeedMeta {
+            title: Some("A".into()),
+            ..Default::default()
+        };
+        let (feed_id, new_entries) = s
+            .add_subscription(
+                "https://a.example/feed",
+                &meta,
+                &["Tech".into()],
+                &[entry("g1", 10)],
+                1,
+            )
+            .unwrap();
+        assert_eq!(new_entries, 1);
+        let feed = s.get_feed(feed_id).unwrap();
+        assert_eq!(feed.title.as_deref(), Some("A"));
+        assert_eq!(feed.folders, vec!["Tech"]);
+        assert_eq!(s.list_entries(&EntryFilter::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn add_subscription_is_atomic_on_failure() {
+        let s = store();
+        let meta = FeedMeta {
+            title: Some("A".into()),
+            ..Default::default()
+        };
+        let err = s
+            .add_subscription(
+                "https://a.example/feed",
+                &meta,
+                &["Tech".into(), "  ".into()],
+                &[entry("g1", 10)],
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert!(s.list_feeds().unwrap().is_empty());
+        assert!(s.list_entries(&EntryFilter::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_feeds_adds_and_merges_folders() {
+        let s = store();
+        let existing = s
+            .insert_feed("https://a.example/feed", Some("Mine"), 1)
+            .unwrap();
+        s.add_feed_to_folder(existing, "News").unwrap();
+
+        let feeds = vec![
+            OpmlFeed {
+                url: "https://a.example/feed".into(),
+                title: Some("From OPML".into()),
+                folders: vec!["Tech".into()],
+            },
+            OpmlFeed {
+                url: "https://b.example/feed".into(),
+                title: Some("B".into()),
+                folders: vec!["Tech".into()],
+            },
+        ];
+        let report = s.import_feeds(&feeds, 2).unwrap();
+        assert_eq!(
+            report,
+            ImportReport {
+                added: 1,
+                merged: 1
+            }
+        );
+
+        let existing_feed = s.get_feed(existing).unwrap();
+        assert_eq!(existing_feed.title.as_deref(), Some("Mine"));
+        assert_eq!(existing_feed.folders, vec!["News", "Tech"]);
+        assert_eq!(s.list_feeds().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn import_feeds_is_atomic_on_failure() {
+        let s = store();
+        let feeds = vec![
+            OpmlFeed {
+                url: "https://a.example/feed".into(),
+                title: None,
+                folders: vec!["Tech".into()],
+            },
+            OpmlFeed {
+                url: "https://b.example/feed".into(),
+                title: None,
+                folders: vec!["  ".into()],
+            },
+        ];
+        let err = s.import_feeds(&feeds, 1).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert!(s.list_feeds().unwrap().is_empty());
     }
 
     // ---- entries ----

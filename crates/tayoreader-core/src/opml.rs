@@ -1,14 +1,7 @@
 //! OPML から購読リストを読み込む。
 
+pub use crate::model::OpmlFeed;
 use crate::{Error, Result};
-
-/// OPML から読み取ったフィード。`folders` は入れ子の内側のフォルダ名。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpmlFeed {
-    pub url: String,
-    pub title: Option<String>,
-    pub folders: Vec<String>,
-}
 
 /// OPML を読み、フィードを出現順に返す。同じ URL が複数フォルダにあれば 1 件にまとめる。
 pub fn parse_opml(xml: &str) -> Result<Vec<OpmlFeed>> {

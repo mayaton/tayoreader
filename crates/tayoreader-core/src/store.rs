@@ -10,9 +10,16 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use rusqlite_migration::{M, Migrations};
 
 use crate::model::{Entry, EntryFilter, Feed, FeedMeta, ImportReport, NewEntry, OpmlFeed};
+use crate::sanitize::search_text;
 use crate::{Error, Result};
 
-const MIGRATIONS: &[M<'static>] = &[M::up(include_str!("../migrations/001_init.sql"))];
+const MIGRATIONS: &[M<'static>] = &[
+    M::up(include_str!("../migrations/001_init.sql")),
+    M::up(include_str!("../migrations/002_search.sql")),
+];
+
+/// 検索用テキストの埋め戻しで 1 トランザクションに入れる件数。
+const BACKFILL_BATCH: i64 = 500;
 
 const FEED_COLUMNS: &str =
     "id, url, title, site_url, etag, last_modified, last_fetched_at, last_error, created_at";
@@ -45,6 +52,7 @@ impl Store {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Migrations::from_slice(MIGRATIONS).to_latest(&mut conn)?;
+        backfill_plain_text(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -343,6 +351,44 @@ fn filter_condition(filter: &EntryFilter) -> (String, Vec<Value>) {
     (sql, args)
 }
 
+/// v2 より前に保存した記事（`plain_text` が NULL）の検索用テキストを埋め、件数を返す。
+/// 埋めた記事があれば索引を最適化する。
+fn backfill_plain_text(conn: &mut Connection) -> Result<usize> {
+    let mut total = 0;
+    loop {
+        let tx = conn.transaction()?;
+        let rows: Vec<(i64, Option<String>, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, summary, content FROM entries WHERE plain_text IS NULL LIMIT ?1",
+            )?;
+            stmt.query_map([BACKFILL_BATCH], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if rows.is_empty() {
+            break;
+        }
+        {
+            // テキストが空の記事も空文字列にして、次に開いたときの対象から外す
+            let mut update = tx.prepare("UPDATE entries SET plain_text = ?2 WHERE id = ?1")?;
+            for (id, summary, content) in &rows {
+                update.execute(params![
+                    id,
+                    search_text(summary.as_deref(), content.as_deref())
+                ])?;
+            }
+        }
+        tx.commit()?;
+        total += rows.len();
+    }
+    if total > 0 {
+        conn.execute(
+            "INSERT INTO entries_fts(entries_fts) VALUES ('optimize')",
+            [],
+        )?;
+    }
+    Ok(total)
+}
+
 fn insert_feed_conn(conn: &Connection, url: &str, title: Option<&str>, now: i64) -> Result<i64> {
     let inserted = conn.execute(
         "INSERT INTO feeds (url, title, created_at) VALUES (?1, ?2, ?3)
@@ -388,15 +434,17 @@ fn save_fetched_conn(
     let mut inserted = 0;
     {
         let mut insert = conn.prepare(
-            "INSERT INTO entries (feed_id, guid, url, title, author, summary, content, published_at, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO entries (feed_id, guid, url, title, author, summary, content, published_at, fetched_at, plain_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(feed_id, guid) DO NOTHING",
         )?;
         let mut update = conn.prepare(
-            "UPDATE entries SET url = ?3, title = ?4, author = ?5, summary = ?6, content = ?7, published_at = ?8
+            "UPDATE entries SET url = ?3, title = ?4, author = ?5, summary = ?6, content = ?7, published_at = ?8,
+                                plain_text = ?9
              WHERE feed_id = ?1 AND guid = ?2",
         )?;
         for e in entries {
+            let text = search_text(e.summary.as_deref(), e.content.as_deref());
             let added = insert.execute(params![
                 feed_id,
                 e.guid,
@@ -406,7 +454,8 @@ fn save_fetched_conn(
                 e.summary,
                 e.content,
                 e.published_at,
-                now
+                now,
+                text
             ])?;
             if added == 1 {
                 inserted += 1;
@@ -419,7 +468,8 @@ fn save_fetched_conn(
                     e.author,
                     e.summary,
                     e.content,
-                    e.published_at
+                    e.published_at,
+                    text
                 ])?;
             }
         }
@@ -1030,5 +1080,205 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(s.mark_all_read(&filter).unwrap(), 3);
+    }
+
+    // ---- 検索の索引 ----
+
+    /// 索引から phrase（二重引用符で囲んだ語）に当たる記事 id を返す。
+    fn fts_ids(s: &Store, phrase: &str) -> Vec<i64> {
+        let conn = s.conn();
+        let mut stmt = conn
+            .prepare("SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?1 ORDER BY rowid")
+            .unwrap();
+        stmt.query_map([format!("\"{phrase}\"")], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// 索引の中身（shadow table）。書き換えが起きたかを比べるのに使う。
+    fn fts_data(s: &Store) -> Vec<(i64, Vec<u8>)> {
+        let conn = s.conn();
+        let mut stmt = conn
+            .prepare("SELECT id, block FROM entries_fts_data ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// 索引と entries の内容が一致していることを確かめる。
+    fn assert_fts_intact(s: &Store) {
+        s.conn()
+            .execute(
+                "INSERT INTO entries_fts(entries_fts, rank) VALUES ('integrity-check', 1)",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn article(guid: &str, title: &str, summary: Option<&str>, content: Option<&str>) -> NewEntry {
+        NewEntry {
+            guid: guid.into(),
+            title: Some(title.into()),
+            summary: summary.map(Into::into),
+            content: content.map(Into::into),
+            published_at: Some(10),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn saving_entries_indexes_title_and_plain_text() {
+        let s = store();
+        let (feed, _) = s
+            .add_subscription(
+                "https://a.example/feed",
+                &FeedMeta::default(),
+                &[],
+                &[article(
+                    "g1",
+                    "台風情報まとめ",
+                    Some("要約"),
+                    Some(r#"<p>本日の<b>天気予報</b>です。<a href="https://secret.example/">詳細</a></p>"#),
+                )],
+                1,
+            )
+            .unwrap();
+        let id = s.list_entries(&filter_by_feed(feed)).unwrap()[0].id;
+        let plain: String = s
+            .conn()
+            .query_row("SELECT plain_text FROM entries WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(plain, "要約\n本日の天気予報です。詳細");
+        assert_eq!(fts_ids(&s, "台風情報"), vec![id]);
+        assert_eq!(fts_ids(&s, "の天気予報で"), vec![id]);
+        // タグや属性の中の文字列は索引に入らない
+        assert!(fts_ids(&s, "secret").is_empty());
+        assert_fts_intact(&s);
+    }
+
+    #[test]
+    fn updating_entry_replaces_index() {
+        let s = store();
+        let feed = s.insert_feed("https://a.example/feed", None, 1).unwrap();
+        s.save_fetched(
+            feed,
+            &FeedMeta::default(),
+            &[article("g1", "古いタイトル", Some("古い本文"), None)],
+            100,
+        )
+        .unwrap();
+        s.save_fetched(
+            feed,
+            &FeedMeta::default(),
+            &[article("g1", "新しいタイトル", None, Some("新しい本文"))],
+            200,
+        )
+        .unwrap();
+        let id = s.list_entries(&EntryFilter::default()).unwrap()[0].id;
+        assert!(fts_ids(&s, "古いタイ").is_empty());
+        assert!(fts_ids(&s, "古い本文").is_empty());
+        assert_eq!(fts_ids(&s, "新しいタイ"), vec![id]);
+        assert_eq!(fts_ids(&s, "新しい本文"), vec![id]);
+        assert_fts_intact(&s);
+    }
+
+    #[test]
+    fn flags_and_unchanged_resave_do_not_rewrite_index() {
+        let s = store();
+        let feed = s.insert_feed("https://a.example/feed", None, 1).unwrap();
+        let entries = [article("g1", "Rust の記事", Some("本文"), None)];
+        s.save_fetched(feed, &FeedMeta::default(), &entries, 100)
+            .unwrap();
+        let id = s.list_entries(&EntryFilter::default()).unwrap()[0].id;
+        let before = fts_data(&s);
+
+        s.set_read(&[id], true).unwrap();
+        s.set_starred(&[id], true).unwrap();
+        s.set_read(&[id], false).unwrap();
+        s.mark_all_read(&EntryFilter::default()).unwrap();
+        // 更新で同じ内容が届いても索引は書き換えない
+        s.save_fetched(feed, &FeedMeta::default(), &entries, 200)
+            .unwrap();
+
+        assert_eq!(fts_data(&s), before);
+        assert_fts_intact(&s);
+    }
+
+    #[test]
+    fn removing_feed_removes_entries_from_index() {
+        let s = store();
+        let feed = s.insert_feed("https://a.example/feed", None, 1).unwrap();
+        s.save_fetched(
+            feed,
+            &FeedMeta::default(),
+            &[article("g1", "消える記事", Some("本文です"), None)],
+            100,
+        )
+        .unwrap();
+        assert_eq!(fts_ids(&s, "消える記事").len(), 1);
+        s.remove_feed(feed).unwrap();
+        assert!(fts_ids(&s, "消える記事").is_empty());
+        assert!(fts_ids(&s, "本文です").is_empty());
+        assert_fts_intact(&s);
+    }
+
+    #[test]
+    fn opening_v1_database_backfills_search_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        {
+            // v1 のスキーマのまま記事を入れる（BACKFILL_BATCH をまたぐ件数）
+            let mut conn = Connection::open(&path).unwrap();
+            Migrations::from_slice(&MIGRATIONS[..1])
+                .to_latest(&mut conn)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO feeds (id, url, created_at) VALUES (1, 'https://a.example/feed', 1)",
+                [],
+            )
+            .unwrap();
+            let tx = conn.transaction().unwrap();
+            for i in 1..=1201 {
+                let (title, summary) = match i {
+                    1 => (
+                        Some("古い記事".to_owned()),
+                        Some("<p>既存の台風情報</p>".to_owned()),
+                    ),
+                    2 => (None, None),
+                    _ => (Some(format!("記事 {i}")), Some(format!("<p>本文 {i}</p>"))),
+                };
+                tx.execute(
+                    "INSERT INTO entries (feed_id, guid, title, summary, fetched_at) VALUES (1, ?1, ?2, ?3, 1)",
+                    params![format!("g{i}"), title, summary],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let s = Store::open(&path).unwrap();
+        let missing: i64 = s
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE plain_text IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing, 0);
+        assert_eq!(fts_ids(&s, "台風情報"), vec![1]);
+        assert_eq!(fts_ids(&s, "古い記事"), vec![1]);
+        assert_eq!(fts_ids(&s, "本文 1201"), vec![1201]);
+        assert_fts_intact(&s);
+        // 埋め戻しは 1 回だけ
+        assert_eq!(backfill_plain_text(&mut s.conn()).unwrap(), 0);
+        drop(s);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(fts_ids(&reopened, "台風情報"), vec![1]);
     }
 }

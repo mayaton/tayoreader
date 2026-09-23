@@ -4,6 +4,7 @@ pub mod error;
 pub mod fetch;
 pub mod model;
 pub mod opml;
+pub mod service;
 pub mod store;
 
 pub use error::{Error, Result};

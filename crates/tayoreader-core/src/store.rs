@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
@@ -38,6 +39,7 @@ impl Store {
     }
 
     fn init(mut conn: Connection) -> Result<Self> {
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Migrations::from_slice(MIGRATIONS).to_latest(&mut conn)?;
         Ok(Self {
@@ -343,6 +345,16 @@ mod tests {
     }
 
     // ---- feeds / folders ----
+
+    #[test]
+    fn busy_timeout_is_five_seconds() {
+        let s = store();
+        let ms: i64 = s
+            .conn()
+            .pragma_query_value(None, "busy_timeout", |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, 5000);
+    }
 
     #[test]
     fn insert_and_get_feed() {

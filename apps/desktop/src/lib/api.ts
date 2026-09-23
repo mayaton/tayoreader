@@ -45,16 +45,19 @@ export type CommandError = { kind: string; message: string };
 
 export interface Api {
   sidebar(): Promise<SidebarView>;
+  // query は検索語（null なら検索しない）。
   listEntries(
     selection: Selection,
     unreadOnly: boolean,
+    query: string | null,
     offset: number,
     limit: number,
   ): Promise<EntrySummary[]>;
+  countEntries(selection: Selection, unreadOnly: boolean, query: string | null): Promise<number>;
   getArticle(id: number): Promise<Article>;
   setRead(ids: number[], read: boolean): Promise<number>;
   setStarred(ids: number[], starred: boolean): Promise<number>;
-  markAllRead(selection: Selection): Promise<number>;
+  markAllRead(selection: Selection, query: string | null): Promise<number>;
   refresh(feedId?: number): Promise<RefreshSummary>;
   addFeed(url: string, folders: string[]): Promise<AddedFeed>;
   removeFeed(id: number): Promise<null>;
@@ -64,12 +67,14 @@ export interface Api {
 
 export const api: Api = {
   sidebar: () => invoke("sidebar"),
-  listEntries: (selection, unreadOnly, offset, limit) =>
-    invoke("list_entries", { selection, unreadOnly, offset, limit }),
+  listEntries: (selection, unreadOnly, query, offset, limit) =>
+    invoke("list_entries", { selection, unreadOnly, query, offset, limit }),
+  countEntries: (selection, unreadOnly, query) =>
+    invoke("count_entries", { selection, unreadOnly, query }),
   getArticle: (id) => invoke("get_article", { id }),
   setRead: (ids, read) => invoke("set_read", { ids, read }),
   setStarred: (ids, starred) => invoke("set_starred", { ids, starred }),
-  markAllRead: (selection) => invoke("mark_all_read", { selection }),
+  markAllRead: (selection, query) => invoke("mark_all_read", { selection, query }),
   refresh: (feedId) => invoke("refresh", { feedId: feedId ?? null }),
   addFeed: (url, folders) => invoke("add_feed", { url, folders }),
   removeFeed: (id) => invoke("remove_feed", { id }),

@@ -22,3 +22,7 @@ tayoreader read 1 2 3
 
 DB は既定で OS のアプリデータディレクトリ（macOS では `~/Library/Application Support/tayoreader/tayoreader.db`）に作られる。
 `--db <PATH>` で別の場所を指定できる。
+
+## ライセンス
+
+MIT License。詳細は [LICENSE](LICENSE)。

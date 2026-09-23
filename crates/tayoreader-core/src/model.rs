@@ -52,9 +52,11 @@ pub struct Entry {
     pub fetched_at: i64,
     pub is_read: bool,
     pub is_starred: bool,
+    /// フィードのタイトル（無ければフィード URL）。
+    pub feed_title: Option<String>,
 }
 
-/// 記事一覧の絞り込み条件。
+/// 記事一覧の絞り込み条件。`limit` / `offset` は `Store::list_entries` だけが使う。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EntryFilter {
     pub unread_only: bool,
@@ -62,6 +64,7 @@ pub struct EntryFilter {
     pub feed_id: Option<i64>,
     pub folder: Option<String>,
     pub limit: Option<u32>,
+    pub offset: Option<u32>,
 }
 
 /// OPML から読み取ったフィード。`folders` は入れ子の内側のフォルダ名。

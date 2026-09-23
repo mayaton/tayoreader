@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/tayoreader-core", "crates/tayoreader-cli"]
+members = [
+    "crates/tayoreader-core",
+    "crates/tayoreader-cli",
+    "apps/desktop/src-tauri",
+]
+# desktop は macOS 以外でビルドしない（WebView の依存がある）ため、既定のビルド対象から外す
+default-members = ["crates/tayoreader-core", "crates/tayoreader-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,6 +15,7 @@ rust-version = "1.95"
 license = "MIT"
 
 [workspace.dependencies]
+ammonia = "4.2.0"
 anyhow = "1.0.104"
 assert_cmd = "2.2.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -22,7 +29,13 @@ predicates = "3.1.4"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rusqlite_migration = "2.6.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = "0.11.0"
+tauri = "2.11.6"
+tauri-build = "2.6.3"
+tauri-plugin-dialog = "2.7.3"
+tauri-plugin-opener = "2.5.5"
 tayoreader-core = { path = "crates/tayoreader-core" }
 tempfile = "3.27.0"
 thiserror = "2.0.20"

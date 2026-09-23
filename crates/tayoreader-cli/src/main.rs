@@ -85,7 +85,8 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<ExitCode> {
     let db = match cli.db {
         Some(path) => path,
-        None => default_db_path()?,
+        None => tayoreader_core::default_db_path()
+            .context("could not determine the application data directory")?,
     };
     let store =
         Store::open(&db).with_context(|| format!("failed to open database {}", db.display()))?;
@@ -150,6 +151,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 feed_id: feed,
                 folder,
                 limit: Some(limit),
+                offset: None,
             };
             for entry in store.list_entries(&filter)? {
                 print_entry(&entry);
@@ -161,12 +163,6 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Unstar { ids } => print_updated(store.set_starred(&ids, false)?, ids.len()),
     }
     Ok(ExitCode::SUCCESS)
-}
-
-fn default_db_path() -> Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "tayoreader")
-        .context("could not determine the application data directory")?;
-    Ok(dirs.data_dir().join("tayoreader.db"))
 }
 
 fn print_feed(feed: &Feed) {

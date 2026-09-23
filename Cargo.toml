@@ -9,6 +9,7 @@ rust-version = "1.95"
 license = "MIT"
 
 [workspace.dependencies]
+ammonia = "4.2.0"
 anyhow = "1.0.104"
 assert_cmd = "2.2.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

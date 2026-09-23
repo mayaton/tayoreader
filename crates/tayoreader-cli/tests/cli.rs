@@ -151,7 +151,9 @@ async fn import_opml_then_refresh_reports_failures() {
         .arg("feeds")
         .assert()
         .success()
-        .stdout(predicate::str::contains("! HTTP error: HTTP 500"));
+        .stdout(predicate::str::contains(
+            "! HTTP error: 500 Internal Server Error",
+        ));
 }
 
 #[test]

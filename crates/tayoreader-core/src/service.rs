@@ -4,10 +4,12 @@ use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
 
+pub use crate::model::ImportReport;
+
 use crate::fetch::{FetchOutcome, Fetcher};
 use crate::model::Feed;
 use crate::opml::parse_opml;
-use crate::store::Store;
+use crate::store::{self, Store};
 use crate::{Error, Result, now};
 
 const MAX_CONCURRENT_FETCHES: usize = 8;
@@ -62,14 +64,6 @@ impl RefreshReport {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ImportReport {
-    /// 新規に購読したフィード数。
-    pub added: usize,
-    /// 購読済みでフォルダだけマージしたフィード数。
-    pub merged: usize,
-}
-
 impl Service {
     pub fn new(store: Store, fetcher: Fetcher) -> Self {
         Self {
@@ -84,6 +78,9 @@ impl Service {
 
     /// フィードを取得し、パースできたら購読として保存する（初回の記事も保存）。
     pub async fn add_feed(&self, url: &str, folders: &[String]) -> Result<AddedFeed> {
+        for folder in folders {
+            store::normalize_folder_name(folder)?;
+        }
         let lookup = url.to_owned();
         if self
             .blocking(move |s| s.find_feed_id_by_url(&lookup))
@@ -98,20 +95,15 @@ impl Service {
         };
         let url = url.to_owned();
         let folders = folders.to_vec();
-        self.blocking(move |s| {
-            let now = now();
-            let feed_id = s.insert_feed(&url, meta.title.as_deref(), now)?;
-            for folder in &folders {
-                s.add_feed_to_folder(feed_id, folder)?;
-            }
-            let new_entries = s.save_fetched(feed_id, &meta, &entries, now)?;
-            Ok(AddedFeed {
-                feed_id,
-                title: meta.title,
-                new_entries,
-            })
+        let title = meta.title.clone();
+        let (feed_id, new_entries) = self
+            .blocking(move |s| s.add_subscription(&url, &meta, &folders, &entries, now()))
+            .await?;
+        Ok(AddedFeed {
+            feed_id,
+            title,
+            new_entries,
         })
-        .await
     }
 
     /// 全フィード（`feed_id` 指定時はそのフィードのみ）を取得する。
@@ -175,27 +167,7 @@ impl Service {
     /// OPML から購読を取り込む。記事の取得はしない。
     pub async fn import_opml(&self, xml: &str) -> Result<ImportReport> {
         let feeds = parse_opml(xml)?;
-        self.blocking(move |s| {
-            let now = now();
-            let mut report = ImportReport::default();
-            for feed in &feeds {
-                let feed_id = match s.find_feed_id_by_url(&feed.url)? {
-                    Some(id) => {
-                        report.merged += 1;
-                        id
-                    }
-                    None => {
-                        report.added += 1;
-                        s.insert_feed(&feed.url, feed.title.as_deref(), now)?
-                    }
-                };
-                for folder in &feed.folders {
-                    s.add_feed_to_folder(feed_id, folder)?;
-                }
-            }
-            Ok(report)
-        })
-        .await
+        self.blocking(move |s| s.import_feeds(&feeds, now())).await
     }
 
     /// DB 処理を blocking スレッドで実行する。
@@ -262,6 +234,22 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn add_feed_rejects_blank_folder_without_fetching() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(RSS))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let svc = service();
+        let err = svc
+            .add_feed(&format!("{}/feed.xml", server.uri()), &["  ".into()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
     }
 
     #[tokio::test]

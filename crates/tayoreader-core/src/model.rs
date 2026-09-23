@@ -63,3 +63,20 @@ pub struct EntryFilter {
     pub folder: Option<String>,
     pub limit: Option<u32>,
 }
+
+/// OPML から読み取ったフィード。`folders` は入れ子の内側のフォルダ名。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpmlFeed {
+    pub url: String,
+    pub title: Option<String>,
+    pub folders: Vec<String>,
+}
+
+/// `Store::import_feeds` の結果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImportReport {
+    /// 新規に購読したフィード数。
+    pub added: usize,
+    /// 購読済みでフォルダだけマージしたフィード数。
+    pub merged: usize,
+}

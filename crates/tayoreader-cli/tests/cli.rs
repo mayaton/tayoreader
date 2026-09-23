@@ -151,7 +151,21 @@ async fn import_opml_then_refresh_reports_failures() {
         .arg("feeds")
         .assert()
         .success()
-        .stdout(predicate::str::contains("! HTTP error: HTTP 500"));
+        .stdout(predicate::str::contains(
+            "! HTTP error: 500 Internal Server Error",
+        ));
+}
+
+#[test]
+fn add_rejects_blank_folder_without_fetching() {
+    let dir = tempfile::tempdir().unwrap();
+    tayoreader(&dir.path().join("tayoreader.db"))
+        .args(["add", "http://127.0.0.1:1/feed.xml", "--folder", ""])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "invalid input: folder name must not be empty",
+        ));
 }
 
 #[test]

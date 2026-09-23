@@ -61,7 +61,7 @@ impl Fetcher {
             return Ok(FetchOutcome::NotModified);
         }
         if !status.is_success() {
-            return Err(Error::Http(format!("HTTP {status}")));
+            return Err(Error::Http(status.to_string()));
         }
         let etag = header_value(&response, header::ETAG);
         let last_modified = header_value(&response, header::LAST_MODIFIED);
@@ -293,10 +293,7 @@ mod tests {
             .fetch(&server.uri(), None, None)
             .await
             .unwrap_err();
-        assert!(
-            matches!(&err, Error::Http(msg) if msg.contains("500")),
-            "{err:?}"
-        );
+        assert_eq!(err.to_string(), "HTTP error: 500 Internal Server Error");
     }
 
     #[tokio::test]

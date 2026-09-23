@@ -3,6 +3,7 @@ name = "tayoreader-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
 feed-rs.workspace = true

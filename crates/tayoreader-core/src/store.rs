@@ -74,21 +74,9 @@ impl Store {
     }
 
     /// フィードをフォルダに入れる。フォルダが無ければ作り、既に入っていれば何もしない。
+    /// 名前の前後の空白は取り除く。空になった場合は `Error::InvalidInput`。
     pub fn add_feed_to_folder(&self, feed_id: i64, folder: &str) -> Result<()> {
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO folders (name) VALUES (?1) ON CONFLICT(name) DO NOTHING",
-            [folder],
-        )?;
-        let folder_id: i64 =
-            conn.query_row("SELECT id FROM folders WHERE name = ?1", [folder], |r| {
-                r.get(0)
-            })?;
-        conn.execute(
-            "INSERT INTO feed_folders (feed_id, folder_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
-            params![feed_id, folder_id],
-        )?;
-        Ok(())
+        add_feed_to_folder_conn(&self.conn(), feed_id, folder)
     }
 
     pub fn get_feed(&self, id: i64) -> Result<Feed> {
@@ -312,6 +300,32 @@ fn entry_from_row(r: &Row<'_>) -> rusqlite::Result<Entry> {
     })
 }
 
+/// フォルダ名の前後の空白を取り除く。空になった場合は `Error::InvalidInput`。
+pub(crate) fn normalize_folder_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidInput("folder name must not be empty".into()));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn add_feed_to_folder_conn(conn: &Connection, feed_id: i64, folder: &str) -> Result<()> {
+    let folder = normalize_folder_name(folder)?;
+    conn.execute(
+        "INSERT INTO folders (name) VALUES (?1) ON CONFLICT(name) DO NOTHING",
+        [&folder],
+    )?;
+    let folder_id: i64 =
+        conn.query_row("SELECT id FROM folders WHERE name = ?1", [&folder], |r| {
+            r.get(0)
+        })?;
+    conn.execute(
+        "INSERT INTO feed_folders (feed_id, folder_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+        params![feed_id, folder_id],
+    )?;
+    Ok(())
+}
+
 fn folders_of(conn: &Connection, feed_id: i64) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT f.name FROM folders f JOIN feed_folders ff ON ff.folder_id = f.id
@@ -403,6 +417,23 @@ mod tests {
         s.add_feed_to_folder(b, "Tech").unwrap();
         assert_eq!(s.get_feed(a).unwrap().folders, vec!["News", "Tech"]);
         assert_eq!(s.get_feed(b).unwrap().folders, vec!["Tech"]);
+    }
+
+    #[test]
+    fn add_feed_to_folder_rejects_blank_name() {
+        let s = store();
+        let a = s.insert_feed("https://a.example/feed", None, 1).unwrap();
+        let err = s.add_feed_to_folder(a, "   ").unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert!(s.get_feed(a).unwrap().folders.is_empty());
+    }
+
+    #[test]
+    fn add_feed_to_folder_trims_whitespace() {
+        let s = store();
+        let a = s.insert_feed("https://a.example/feed", None, 1).unwrap();
+        s.add_feed_to_folder(a, "  Tech  ").unwrap();
+        assert_eq!(s.get_feed(a).unwrap().folders, vec!["Tech"]);
     }
 
     #[test]

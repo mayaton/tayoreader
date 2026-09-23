@@ -18,6 +18,8 @@ pub enum Error {
     NotFound(String),
     #[error("already subscribed: {0}")]
     AlreadySubscribed(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

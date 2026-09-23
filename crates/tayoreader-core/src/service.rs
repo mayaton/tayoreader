@@ -7,7 +7,7 @@ use futures::stream::{self, StreamExt};
 use crate::fetch::{FetchOutcome, Fetcher};
 use crate::model::Feed;
 use crate::opml::parse_opml;
-use crate::store::Store;
+use crate::store::{self, Store};
 use crate::{Error, Result, now};
 
 const MAX_CONCURRENT_FETCHES: usize = 8;
@@ -84,6 +84,9 @@ impl Service {
 
     /// フィードを取得し、パースできたら購読として保存する（初回の記事も保存）。
     pub async fn add_feed(&self, url: &str, folders: &[String]) -> Result<AddedFeed> {
+        for folder in folders {
+            store::normalize_folder_name(folder)?;
+        }
         let lookup = url.to_owned();
         if self
             .blocking(move |s| s.find_feed_id_by_url(&lookup))
@@ -262,6 +265,22 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn add_feed_rejects_blank_folder_without_fetching() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(RSS))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let svc = service();
+        let err = svc
+            .add_feed(&format!("{}/feed.xml", server.uri()), &["  ".into()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
     }
 
     #[tokio::test]

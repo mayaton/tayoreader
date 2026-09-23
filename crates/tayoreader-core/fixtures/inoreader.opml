@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="1.0">
+  <head>
+    <title>Subscriptions from Inoreader</title>
+  </head>
+  <body>
+    <outline text="Tech" title="Tech">
+      <outline text="Example Blog" title="Example Blog" type="rss" xmlUrl="https://example.com/feed.xml" htmlUrl="https://example.com/"/>
+      <outline text="Atom Site" title="Atom Site" type="rss" xmlUrl="https://example.org/feed.atom" htmlUrl="https://example.org/"/>
+    </outline>
+    <outline text="News" title="News">
+      <outline text="Example Blog" title="Example Blog" type="rss" xmlUrl="https://example.com/feed.xml" htmlUrl="https://example.com/"/>
+      <outline text="Archive">
+        <outline text="Old Site" type="rss" xmlUrl="https://old.example.net/rss"/>
+      </outline>
+    </outline>
+    <outline text="Loose" type="rss" xmlUrl="https://loose.example.net/feed"/>
+  </body>
+</opml>

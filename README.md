@@ -28,6 +28,7 @@ tayoreader add https://blog.rust-lang.org/feed.xml --folder Rust
 tayoreader import-opml ~/Downloads/inoreader.opml
 tayoreader refresh
 tayoreader entries --unread
+tayoreader entries --search "台風 情報"      # タイトル・本文を検索（語はすべて含む）
 tayoreader read 1 2 3
 ```
 

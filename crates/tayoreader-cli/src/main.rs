@@ -151,6 +151,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 feed_id: feed,
                 folder,
                 limit: Some(limit),
+                offset: None,
             };
             for entry in store.list_entries(&filter)? {
                 print_entry(&entry);

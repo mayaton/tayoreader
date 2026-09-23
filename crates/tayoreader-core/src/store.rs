@@ -1,5 +1,6 @@
 //! SQLite への読み書き。DB アクセスはすべてこのモジュールを通す。
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -16,7 +17,9 @@ const MIGRATIONS: &[M<'static>] = &[M::up(include_str!("../migrations/001_init.s
 const FEED_COLUMNS: &str =
     "id, url, title, site_url, etag, last_modified, last_fetched_at, last_error, created_at";
 
-const ENTRY_COLUMNS: &str = "e.id, e.feed_id, e.guid, e.url, e.title, e.author, e.summary, e.content, e.published_at, e.fetched_at, e.is_read, e.is_starred";
+const ENTRY_COLUMNS: &str = "e.id, e.feed_id, e.guid, e.url, e.title, e.author, e.summary, e.content, e.published_at, e.fetched_at, e.is_read, e.is_starred, COALESCE(NULLIF(TRIM(f.title), ''), f.url)";
+
+const ENTRY_FROM: &str = "entries e JOIN feeds f ON f.id = e.feed_id";
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -188,29 +191,19 @@ impl Store {
 
     /// 記事を新しい順（公開日時が無ければ取得日時）で返す。
     pub fn list_entries(&self, filter: &EntryFilter) -> Result<Vec<Entry>> {
-        let mut sql = format!("SELECT {ENTRY_COLUMNS} FROM entries e WHERE 1 = 1");
-        let mut args: Vec<Value> = Vec::new();
-        if filter.unread_only {
-            sql.push_str(" AND e.is_read = 0");
-        }
-        if filter.starred_only {
-            sql.push_str(" AND e.is_starred = 1");
-        }
-        if let Some(feed_id) = filter.feed_id {
-            sql.push_str(" AND e.feed_id = ?");
-            args.push(feed_id.into());
-        }
-        if let Some(folder) = &filter.folder {
-            sql.push_str(
-                " AND e.feed_id IN (SELECT ff.feed_id FROM feed_folders ff
-                                     JOIN folders f ON f.id = ff.folder_id WHERE f.name = ?)",
-            );
-            args.push(folder.clone().into());
-        }
-        sql.push_str(" ORDER BY COALESCE(e.published_at, e.fetched_at) DESC, e.id DESC");
-        if let Some(limit) = filter.limit {
-            sql.push_str(" LIMIT ?");
-            args.push(i64::from(limit).into());
+        let (condition, mut args) = filter_condition(filter);
+        let mut sql = format!(
+            "SELECT {ENTRY_COLUMNS} FROM {ENTRY_FROM} WHERE {condition}
+             ORDER BY COALESCE(e.published_at, e.fetched_at) DESC, e.id DESC"
+        );
+        match (filter.limit, filter.offset) {
+            (None, None) => {}
+            (limit, offset) => {
+                // SQLite は OFFSET だけを書けないため、limit が無ければ -1（無制限）にする
+                sql.push_str(" LIMIT ? OFFSET ?");
+                args.push(limit.map_or(-1, i64::from).into());
+                args.push(i64::from(offset.unwrap_or(0)).into());
+            }
         }
         let conn = self.conn();
         let mut stmt = conn.prepare(&sql)?;
@@ -218,6 +211,53 @@ impl Store {
             .query_map(params_from_iter(args), entry_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(entries)
+    }
+
+    /// 記事を 1 件返す。無ければ `NotFound("entry {id}")`。
+    pub fn get_entry(&self, id: i64) -> Result<Entry> {
+        self.conn()
+            .query_row(
+                &format!("SELECT {ENTRY_COLUMNS} FROM {ENTRY_FROM} WHERE e.id = ?1"),
+                [id],
+                entry_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("entry {id}")))
+    }
+
+    /// filter に合う記事の件数を返す。`limit` / `offset` は無視する。
+    pub fn count_entries(&self, filter: &EntryFilter) -> Result<u32> {
+        let (condition, args) = filter_condition(filter);
+        let count = self.conn().query_row(
+            &format!("SELECT COUNT(*) FROM {ENTRY_FROM} WHERE {condition}"),
+            params_from_iter(args),
+            |r| r.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// feed_id ごとの未読数を返す。未読が 0 のフィードは含まない。
+    pub fn unread_counts(&self) -> Result<HashMap<i64, u32>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT feed_id, COUNT(*) FROM entries WHERE is_read = 0 GROUP BY feed_id")?;
+        let counts = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+        Ok(counts)
+    }
+
+    /// filter に合う未読をすべて既読にし、更新件数を返す。`limit` / `offset` は無視する。
+    pub fn mark_all_read(&self, filter: &EntryFilter) -> Result<usize> {
+        let (condition, args) = filter_condition(filter);
+        let updated = self.conn().execute(
+            &format!(
+                "UPDATE entries SET is_read = 1
+                 WHERE is_read = 0 AND id IN (SELECT e.id FROM {ENTRY_FROM} WHERE {condition})"
+            ),
+            params_from_iter(args),
+        )?;
+        Ok(updated)
     }
 
     /// 既読・未読を付ける。更新できた件数を返す（存在しない id は無視）。
@@ -275,7 +315,32 @@ fn entry_from_row(r: &Row<'_>) -> rusqlite::Result<Entry> {
         fetched_at: r.get(9)?,
         is_read: r.get(10)?,
         is_starred: r.get(11)?,
+        feed_title: r.get(12)?,
     })
+}
+
+/// filter の絞り込み条件（`limit` / `offset` 以外）を WHERE 句とパラメータにする。
+fn filter_condition(filter: &EntryFilter) -> (String, Vec<Value>) {
+    let mut sql = String::from("1 = 1");
+    let mut args: Vec<Value> = Vec::new();
+    if filter.unread_only {
+        sql.push_str(" AND e.is_read = 0");
+    }
+    if filter.starred_only {
+        sql.push_str(" AND e.is_starred = 1");
+    }
+    if let Some(feed_id) = filter.feed_id {
+        sql.push_str(" AND e.feed_id = ?");
+        args.push(feed_id.into());
+    }
+    if let Some(folder) = &filter.folder {
+        sql.push_str(
+            " AND e.feed_id IN (SELECT ff.feed_id FROM feed_folders ff
+                                 JOIN folders fo ON fo.id = ff.folder_id WHERE fo.name = ?)",
+        );
+        args.push(folder.clone().into());
+    }
+    (sql, args)
 }
 
 fn insert_feed_conn(conn: &Connection, url: &str, title: Option<&str>, now: i64) -> Result<i64> {
@@ -816,5 +881,154 @@ mod tests {
         assert_eq!(s.set_read(&[id], false).unwrap(), 1);
         assert!(!s.list_entries(&EntryFilter::default()).unwrap()[0].is_read);
         assert_eq!(s.set_starred(&[9999], true).unwrap(), 0);
+    }
+
+    // ---- GUI 向けの参照・一括操作 ----
+
+    /// フィード a（フォルダ Tech、記事 a1=10, a2=30）と b（フォルダなし、b1=20）を作る。
+    fn two_feeds() -> (Store, i64, i64) {
+        let s = store();
+        let a = s
+            .insert_feed("https://a.example/feed", Some("A"), 1)
+            .unwrap();
+        // タイトルが空白だけのフィードは URL で表示する
+        let b = s
+            .insert_feed("https://b.example/feed", Some("  "), 1)
+            .unwrap();
+        s.add_feed_to_folder(a, "Tech").unwrap();
+        s.save_fetched(
+            a,
+            &FeedMeta::default(),
+            &[entry("a1", 10), entry("a2", 30)],
+            100,
+        )
+        .unwrap();
+        s.save_fetched(b, &FeedMeta::default(), &[entry("b1", 20)], 100)
+            .unwrap();
+        (s, a, b)
+    }
+
+    fn filter_by_feed(feed_id: i64) -> EntryFilter {
+        EntryFilter {
+            feed_id: Some(feed_id),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn list_entries_includes_feed_title_or_url() {
+        let (s, _, _) = two_feeds();
+        let feed_titles: Vec<Option<String>> = s
+            .list_entries(&EntryFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.feed_title)
+            .collect();
+        assert_eq!(
+            feed_titles,
+            vec![
+                Some("A".into()),
+                Some("https://b.example/feed".into()),
+                Some("A".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn list_entries_pages_with_offset() {
+        let (s, _, _) = two_feeds();
+        let page = |limit, offset| {
+            let entries = s
+                .list_entries(&EntryFilter {
+                    limit,
+                    offset,
+                    ..Default::default()
+                })
+                .unwrap();
+            entries.iter().map(|e| e.guid.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(page(Some(2), Some(0)), vec!["a2", "b1"]);
+        assert_eq!(page(Some(2), Some(2)), vec!["a1"]);
+        assert_eq!(page(None, Some(1)), vec!["b1", "a1"]);
+        assert!(page(Some(2), Some(5)).is_empty());
+    }
+
+    #[test]
+    fn get_entry_returns_entry_or_not_found() {
+        let (s, a, _) = two_feeds();
+        let id = s.list_entries(&filter_by_feed(a)).unwrap()[0].id;
+        let e = s.get_entry(id).unwrap();
+        assert_eq!(e.guid, "a2");
+        assert_eq!(e.feed_title.as_deref(), Some("A"));
+        let err = s.get_entry(9999).unwrap_err();
+        assert!(
+            matches!(&err, Error::NotFound(m) if m == "entry 9999"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn unread_counts_by_feed() {
+        let (s, a, b) = two_feeds();
+        let a2 = s.list_entries(&filter_by_feed(a)).unwrap()[0].id;
+        s.set_read(&[a2], true).unwrap();
+        assert_eq!(s.unread_counts().unwrap(), HashMap::from([(a, 1), (b, 1)]));
+        s.mark_all_read(&filter_by_feed(b)).unwrap();
+        assert_eq!(s.unread_counts().unwrap(), HashMap::from([(a, 1)]));
+    }
+
+    #[test]
+    fn count_entries_ignores_limit() {
+        let (s, a, _) = two_feeds();
+        let a2 = s.list_entries(&filter_by_feed(a)).unwrap()[0].id;
+        s.set_starred(&[a2], true).unwrap();
+        let starred = EntryFilter {
+            starred_only: true,
+            limit: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(s.count_entries(&starred).unwrap(), 1);
+        assert_eq!(s.count_entries(&EntryFilter::default()).unwrap(), 3);
+    }
+
+    #[test]
+    fn mark_all_read_by_feed_folder_and_starred() {
+        let (s, a, b) = two_feeds();
+        let unread = |filter: EntryFilter| {
+            s.count_entries(&EntryFilter {
+                unread_only: true,
+                ..filter
+            })
+            .unwrap()
+        };
+
+        let b1 = s.list_entries(&filter_by_feed(b)).unwrap()[0].id;
+        s.set_starred(&[b1], true).unwrap();
+        let starred = EntryFilter {
+            starred_only: true,
+            ..Default::default()
+        };
+        assert_eq!(s.mark_all_read(&starred).unwrap(), 1);
+        assert_eq!(unread(filter_by_feed(b)), 0);
+        assert_eq!(unread(filter_by_feed(a)), 2);
+
+        let tech = EntryFilter {
+            folder: Some("Tech".into()),
+            ..Default::default()
+        };
+        assert_eq!(s.mark_all_read(&tech).unwrap(), 2);
+        assert_eq!(s.mark_all_read(&tech).unwrap(), 0);
+        assert_eq!(unread(EntryFilter::default()), 0);
+    }
+
+    #[test]
+    fn mark_all_read_ignores_limit_and_offset() {
+        let (s, _, _) = two_feeds();
+        let filter = EntryFilter {
+            limit: Some(1),
+            offset: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(s.mark_all_read(&filter).unwrap(), 3);
     }
 }

@@ -1,10 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Api, Article, EntrySummary, Selection, SidebarView } from "./api";
+import { searchTerms } from "./search";
 import {
   PAGE_SIZE,
   Reader,
+  SEARCH_DEBOUNCE_MS,
   adjustUnread,
+  markAllReadMessage,
   refreshMessage,
+  searchSummary,
   selectionTitle,
   sidebarItems,
 } from "./stores.svelte";
@@ -54,19 +58,26 @@ function sidebarView(): SidebarView {
   };
 }
 
-// DB 代わりの記事配列から一覧を返すモック。
+// DB 代わりの記事配列から一覧を返すモック。検索語はタイトルだけで照合する。
 function mockApi(rows: EntrySummary[]) {
-  const matches = (sel: Selection, unreadOnly: boolean, e: EntrySummary) => {
-    if (sel.kind === "starred") return e.isStarred;
-    return (!unreadOnly || !e.isRead) && (sel.kind !== "feed" || e.feedId === sel.id);
+  const matches = (sel: Selection, unreadOnly: boolean, query: string | null, e: EntrySummary) => {
+    const title = e.title.toLowerCase();
+    const found = searchTerms(query ?? "").every((t) => title.includes(t.toLowerCase()));
+    if (sel.kind === "starred") return e.isStarred && found;
+    return (!unreadOnly || !e.isRead) && (sel.kind !== "feed" || e.feedId === sel.id) && found;
   };
   const api = {
     sidebar: vi.fn(async () => sidebarView()),
-    listEntries: vi.fn(async (sel: Selection, unreadOnly: boolean, offset: number, limit: number) =>
-      rows
-        .filter((e) => matches(sel, unreadOnly, e))
-        .slice(offset, offset + limit)
-        .map((e) => ({ ...e })),
+    listEntries: vi.fn(
+      async (sel: Selection, unreadOnly: boolean, query: string | null, offset: number, limit: number) =>
+        rows
+          .filter((e) => matches(sel, unreadOnly, query, e))
+          .slice(offset, offset + limit)
+          .map((e) => ({ ...e })),
+    ),
+    countEntries: vi.fn(
+      async (sel: Selection, unreadOnly: boolean, query: string | null) =>
+        rows.filter((e) => matches(sel, unreadOnly, query, e)).length,
     ),
     getArticle: vi.fn(async (id: number) => article(rows.find((e) => e.id === id)!)),
     setRead: vi.fn(async (ids: number[], read: boolean) => {
@@ -105,7 +116,8 @@ describe("Reader", () => {
   it("起動時にサイドバーと未読一覧を読み、記事は自動で選ばない", () => {
     expect(reader.sidebar?.totalUnread).toBe(5);
     expect(reader.entries.map((e) => e.id)).toEqual([1, 2, 3]);
-    expect(api.listEntries).toHaveBeenCalledWith({ kind: "all" }, true, 0, PAGE_SIZE);
+    expect(api.listEntries).toHaveBeenCalledWith({ kind: "all" }, true, null, 0, PAGE_SIZE);
+    expect(api.countEntries).not.toHaveBeenCalled();
     expect(reader.selectedId).toBeNull();
     expect(reader.article).toBeNull();
   });
@@ -211,7 +223,7 @@ describe("Reader", () => {
 
   it("すべて既読にしても一覧からは消さない", async () => {
     await reader.markAllRead();
-    expect(api.markAllRead).toHaveBeenCalledWith({ kind: "all" });
+    expect(api.markAllRead).toHaveBeenCalledWith({ kind: "all" }, null);
     expect(reader.entries.every((e) => e.isRead)).toBe(true);
     expect(reader.entries).toHaveLength(3);
     expect(api.sidebar).toHaveBeenCalledTimes(2);
@@ -254,7 +266,13 @@ describe("Reader", () => {
       await reader.selectEntry(1);
       await reader.selectEntry(2);
       await reader.loadMore();
-      expect(api.listEntries).toHaveBeenLastCalledWith({ kind: "all" }, true, PAGE_SIZE - 2, PAGE_SIZE);
+      expect(api.listEntries).toHaveBeenLastCalledWith(
+        { kind: "all" },
+        true,
+        null,
+        PAGE_SIZE - 2,
+        PAGE_SIZE,
+      );
       const ids = reader.entries.map((e) => e.id);
       expect(ids).toHaveLength(PAGE_SIZE + 5);
       expect(new Set(ids).size).toBe(ids.length);
@@ -263,7 +281,7 @@ describe("Reader", () => {
     it("スター表示中に外した記事は一覧に残し、offset からは除く", async () => {
       rows.slice(0, PAGE_SIZE + 1).forEach((e) => (e.isStarred = true));
       await reader.select({ kind: "starred" });
-      expect(api.listEntries).toHaveBeenLastCalledWith({ kind: "starred" }, true, 0, PAGE_SIZE);
+      expect(api.listEntries).toHaveBeenLastCalledWith({ kind: "starred" }, true, null, 0, PAGE_SIZE);
       await reader.selectEntry(1);
       await reader.toggleStar();
       expect(reader.entries[0]).toMatchObject({ id: 1, isStarred: false });
@@ -271,6 +289,7 @@ describe("Reader", () => {
       expect(api.listEntries).toHaveBeenLastCalledWith(
         { kind: "starred" },
         true,
+        null,
         PAGE_SIZE - 1,
         PAGE_SIZE,
       );
@@ -401,6 +420,135 @@ describe("Reader", () => {
     });
   });
 
+  describe("検索", () => {
+    beforeEach(async () => {
+      rows.splice(
+        0,
+        rows.length,
+        entry(1, { title: "台風情報" }),
+        entry(2, { title: "天気予報" }),
+        entry(3, { feedId: 2, title: "台風の進路" }),
+      );
+      await reader.select({ kind: "all" });
+      api.listEntries.mockClear();
+      api.countEntries.mockClear();
+    });
+
+    async function search(text: string): Promise<void> {
+      reader.setSearchText(text);
+      await reader.applySearch();
+    }
+
+    it("入力が止まってから 1 回だけ検索し、件数も取る", async () => {
+      vi.useFakeTimers();
+      try {
+        reader.setSearchText("台");
+        await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS - 1);
+        reader.setSearchText("台風");
+        await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS - 1);
+        expect(api.listEntries).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(api.listEntries).toHaveBeenCalledTimes(1);
+        expect(api.listEntries).toHaveBeenCalledWith({ kind: "all" }, true, "台風", 0, PAGE_SIZE);
+        expect(api.countEntries).toHaveBeenCalledWith({ kind: "all" }, true, "台風");
+        expect(reader.query).toBe("台風");
+        expect(reader.entries.map((e) => e.id)).toEqual([1, 3]);
+        expect(reader.searchCount).toBe(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("前後の空白だけが変わったときや空白だけのときは読み直さない", async () => {
+      await search("   ");
+      expect(reader.query).toBe("");
+      await search("台風");
+      await search(" 台風　");
+      expect(api.listEntries).toHaveBeenCalledTimes(1);
+    });
+
+    it("検索を解除すると全件を読み直し、件数を消す", async () => {
+      await search("台風");
+      await reader.clearSearch();
+      expect(reader.searchText).toBe("");
+      expect(reader.query).toBe("");
+      expect(reader.searchCount).toBeNull();
+      expect(api.listEntries).toHaveBeenLastCalledWith({ kind: "all" }, true, null, 0, PAGE_SIZE);
+      expect(reader.entries).toHaveLength(3);
+    });
+
+    it("サイドバーの選択を変えても検索語を保つ", async () => {
+      await search("台風");
+      await reader.select({ kind: "feed", id: 2 });
+      expect(reader.query).toBe("台風");
+      expect(api.listEntries).toHaveBeenLastCalledWith(
+        { kind: "feed", id: 2 },
+        true,
+        "台風",
+        0,
+        PAGE_SIZE,
+      );
+      expect(api.countEntries).toHaveBeenLastCalledWith({ kind: "feed", id: 2 }, true, "台風");
+      expect(reader.entries.map((e) => e.id)).toEqual([3]);
+      expect(reader.searchCount).toBe(1);
+    });
+
+    it("すべて既読は検索結果だけを対象にする", async () => {
+      await search("台風");
+      await reader.markAllRead();
+      expect(api.markAllRead).toHaveBeenCalledWith({ kind: "all" }, "台風");
+    });
+
+    it("更新後の再取得でも検索語を渡し、件数を取り直す", async () => {
+      await search("台風");
+      rows.unshift(entry(0, { title: "新しい台風" }));
+      await reader.refresh({ quiet: true });
+      expect(api.listEntries).toHaveBeenLastCalledWith({ kind: "all" }, true, "台風", 0, PAGE_SIZE);
+      expect(reader.entries.map((e) => e.id)).toEqual([0, 1, 3]);
+      expect(reader.searchCount).toBe(3);
+    });
+
+    it("古い検索の応答で一覧と件数を上書きしない", async () => {
+      let release!: () => void;
+      const slow = new Promise<void>((r) => (release = r));
+      api.listEntries.mockImplementationOnce(async () => {
+        await slow;
+        return [entry(9, { title: "台" })];
+      });
+      api.countEntries.mockImplementationOnce(async () => {
+        await slow;
+        return 99;
+      });
+      reader.setSearchText("台");
+      const first = reader.applySearch();
+      await search("台風の");
+      release();
+      await first;
+      expect(reader.query).toBe("台風の");
+      expect(reader.entries.map((e) => e.id)).toEqual([3]);
+      expect(reader.searchCount).toBe(1);
+    });
+
+    it("追加読み込みでも検索語を渡す", async () => {
+      rows.splice(
+        0,
+        rows.length,
+        ...Array.from({ length: PAGE_SIZE + 5 }, (_, i) => entry(i + 1, { title: `台風 ${i + 1}` })),
+      );
+      await search("台風");
+      expect(reader.entries).toHaveLength(PAGE_SIZE);
+      await reader.loadMore();
+      expect(api.listEntries).toHaveBeenLastCalledWith(
+        { kind: "all" },
+        true,
+        "台風",
+        PAGE_SIZE,
+        PAGE_SIZE,
+      );
+      expect(reader.entries).toHaveLength(PAGE_SIZE + 5);
+    });
+  });
+
   it("] / [ でサイドバーの項目を巡る", async () => {
     await reader.nextSource();
     expect(reader.selection).toEqual({ kind: "starred" });
@@ -456,6 +604,17 @@ describe("純粋関数", () => {
     expect(selectionTitle(view, { kind: "starred" }, true)).toBe("スター");
     expect(selectionTitle(view, { kind: "folder", name: "Tech" }, true)).toBe("Tech");
     expect(selectionTitle(view, { kind: "feed", id: 2 }, true)).toBe("B");
+  });
+
+  it("searchSummary", () => {
+    expect(searchSummary("台風", 3)).toBe('"台風" の検索結果（3 件）');
+    expect(searchSummary("台風", null)).toBe('"台風" の検索結果');
+  });
+
+  it("markAllReadMessage", () => {
+    expect(markAllReadMessage("", null)).toBe("表示中の記事をすべて既読にしますか？");
+    expect(markAllReadMessage("台風", 2)).toBe("検索結果の 2 件をすべて既読にしますか？");
+    expect(markAllReadMessage("台風", null)).toBe("検索結果をすべて既読にしますか？");
   });
 
   it("refreshMessage", () => {

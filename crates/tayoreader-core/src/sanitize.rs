@@ -1,4 +1,4 @@
-//! 記事 HTML のサニタイズと、一覧用のプレーンテキスト抜粋。
+//! 記事 HTML のサニタイズと、一覧用の抜粋・検索用のプレーンテキスト。
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -77,6 +77,32 @@ fn resolve_srcset(value: &str, base: Option<&Url>) -> Option<String> {
 
 /// タグを除いたテキストを返す。空白は 1 つにまとめ、`max_chars` 文字を超えたら切って `…` を付ける。
 pub fn plain_snippet(html: &str, max_chars: usize) -> String {
+    let normalized = plain_text(html);
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut cut: String = normalized.chars().take(max_chars).collect();
+    cut.truncate(cut.trim_end().len());
+    cut.push('…');
+    cut
+}
+
+/// 検索の索引に入れるテキストを返す。
+///
+/// summary と content をそれぞれ `plain_snippet` と同じ規則でテキストにし、改行 1 つで連結する。
+/// 文字数は切り詰めない。同じテキストになったものと空のものは入れない。
+pub fn search_text(summary: Option<&str>, content: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for text in [summary, content].into_iter().flatten().map(plain_text) {
+        if !text.is_empty() && !parts.contains(&text) {
+            parts.push(text);
+        }
+    }
+    parts.join("\n")
+}
+
+/// タグを除き、エンティティを戻し、空白を 1 つにまとめたテキストを返す。
+fn plain_text(html: &str) -> String {
     let text = Builder::empty()
         .clean_content_tags(HashSet::from(DROP_WITH_CONTENT))
         .clean(html)
@@ -88,14 +114,7 @@ pub fn plain_snippet(html: &str, max_chars: usize) -> String {
         .replace("&quot;", "\"")
         .replace("&nbsp;", " ")
         .replace("&amp;", "&");
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= max_chars {
-        return normalized;
-    }
-    let mut cut: String = normalized.chars().take(max_chars).collect();
-    cut.truncate(cut.trim_end().len());
-    cut.push('…');
-    cut
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -180,5 +199,37 @@ mod tests {
         assert_eq!(plain_snippet("日本語のテキスト", 3), "日本語…");
         assert_eq!(plain_snippet("abc", 3), "abc");
         assert_eq!(plain_snippet("ab cd", 3), "ab…");
+    }
+
+    #[test]
+    fn search_text_strips_tags_and_joins_with_newline() {
+        let summary = "<p>台風 &amp; 大雨の<b>情報</b></p>";
+        let content = r#"<p>本文<script>alert(1)</script></p>
+<p><a href="https://secret.example/">リンク</a>の続き</p>"#;
+        assert_eq!(
+            search_text(Some(summary), Some(content)),
+            "台風 & 大雨の情報\n本文 リンクの続き"
+        );
+    }
+
+    #[test]
+    fn search_text_does_not_truncate() {
+        let long = "長い".repeat(300);
+        assert_eq!(search_text(None, Some(&long)), long);
+    }
+
+    #[test]
+    fn search_text_skips_duplicate_and_empty_parts() {
+        // HTML が違ってもテキストが同じなら 1 回だけ入れる
+        assert_eq!(
+            search_text(Some("Same text"), Some("<p>Same   text</p>")),
+            "Same text"
+        );
+        assert_eq!(
+            search_text(Some(r#"<img src="x.png">"#), Some("本文")),
+            "本文"
+        );
+        assert_eq!(search_text(Some("要約"), None), "要約");
+        assert_eq!(search_text(None, None), "");
     }
 }

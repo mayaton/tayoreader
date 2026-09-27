@@ -1,9 +1,13 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { relativeTime } from "../lib/format";
-  import { selectionTitle, type Reader } from "../lib/stores.svelte";
+  import { highlight, searchTerms } from "../lib/search";
+  import { searchSummary, selectionTitle, type Reader } from "../lib/stores.svelte";
 
-  let { reader }: { reader: Reader } = $props();
+  let { reader, searchInput = $bindable() }: { reader: Reader; searchInput?: HTMLInputElement } =
+    $props();
+
+  const terms = $derived(searchTerms(reader.query));
 
   let list: HTMLElement | undefined = $state();
   let now = $state(Math.floor(Date.now() / 1000));
@@ -18,8 +22,15 @@
   $effect(() => {
     void reader.selection;
     void reader.unreadOnly;
+    void reader.query;
     if (list) list.scrollTop = 0;
   });
+
+  // IME の変換中は検索しない（確定したときに compositionend で検索する）
+  function onSearchInput(event: Event & { currentTarget: HTMLInputElement }): void {
+    if (event instanceof InputEvent && event.isComposing) return;
+    reader.setSearchText(event.currentTarget.value);
+  }
 
   function onScroll(): void {
     if (list && list.scrollTop + list.clientHeight >= list.scrollHeight - 200) void reader.loadMore();
@@ -31,18 +42,38 @@
   });
 </script>
 
+<!-- 検索語に一致する部分を <mark> で囲む。HTML として挿入しない -->
+{#snippet marked(text: string)}
+  {#each highlight(text, terms) as part}{#if part.match}<mark>{part.text}</mark>{:else}{part.text}{/if}{/each}
+{/snippet}
+
 <section class="entries">
   <header>
-    <h2>{selectionTitle(reader.sidebar, reader.selection, reader.unreadOnly)}</h2>
-    <button
-      class="toggle"
-      tabindex="-1"
-      title="未読のみ / すべて（u）"
-      disabled={reader.selection.kind === "starred"}
-      onclick={() => reader.toggleUnreadOnly()}
-    >
-      {reader.unreadOnly && reader.selection.kind !== "starred" ? "未読のみ" : "すべて"}
-    </button>
+    <input
+      bind:this={searchInput}
+      class="search"
+      type="search"
+      placeholder="記事を検索"
+      title="記事を検索（/）"
+      value={reader.searchText}
+      oninput={onSearchInput}
+      oncompositionend={(e) => reader.setSearchText(e.currentTarget.value)}
+    />
+    <div class="heading">
+      <h2>{selectionTitle(reader.sidebar, reader.selection, reader.unreadOnly)}</h2>
+      <button
+        class="toggle"
+        tabindex="-1"
+        title="未読のみ / すべて（u）"
+        disabled={reader.selection.kind === "starred"}
+        onclick={() => reader.toggleUnreadOnly()}
+      >
+        {reader.unreadOnly && reader.selection.kind !== "starred" ? "未読のみ" : "すべて"}
+      </button>
+    </div>
+    {#if reader.query}
+      <p class="summary">{searchSummary(reader.query, reader.searchCount)}</p>
+    {/if}
   </header>
   <ul bind:this={list} onscroll={onScroll}>
     {#each reader.entries as entry (entry.id)}
@@ -58,14 +89,14 @@
           <span class="title">
             <span class="dot" aria-label={entry.isRead ? "既読" : "未読"}></span>
             {#if entry.isStarred}<span class="star">★</span>{/if}
-            {entry.title}
+            <span class="text">{@render marked(entry.title)}</span>
           </span>
           <span class="meta">{entry.feedTitle} · {relativeTime(entry.publishedAt, now)}</span>
-          <span class="snippet">{entry.snippet}</span>
+          <span class="snippet">{@render marked(entry.snippet)}</span>
         </button>
       </li>
     {:else}
-      <li class="empty">記事はありません</li>
+      <li class="empty">{reader.query ? "一致する記事はありません" : "記事はありません"}</li>
     {/each}
   </ul>
 </section>
@@ -80,10 +111,34 @@
   }
   header {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
+    flex-direction: column;
+    gap: 8px;
     padding: 10px 14px;
     border-bottom: 1px solid var(--border);
+  }
+  .search {
+    width: 100%;
+    font: inherit;
+    font-size: 13px;
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+  }
+  .heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .summary {
+    margin: -4px 0 0;
+    font-size: 12px;
+    color: var(--fg-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   h2 {
     margin: 0;
@@ -161,6 +216,14 @@
     line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
+  }
+  mark {
+    background: var(--mark);
+    color: inherit;
+    border-radius: 2px;
+  }
+  .selected mark {
+    background: var(--mark-selected);
   }
   .empty {
     padding: 24px;

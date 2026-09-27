@@ -23,6 +23,7 @@ pub async fn list_entries(
     state: State<'_, AppState>,
     selection: Selection,
     unread_only: bool,
+    query: Option<String>,
     offset: u32,
     limit: u32,
 ) -> CmdResult<Vec<EntrySummary>> {
@@ -30,8 +31,24 @@ pub async fn list_entries(
         state.service.store(),
         &selection,
         unread_only,
+        query.as_deref(),
         offset,
         limit,
+    )?)
+}
+
+#[tauri::command]
+pub async fn count_entries(
+    state: State<'_, AppState>,
+    selection: Selection,
+    unread_only: bool,
+    query: Option<String>,
+) -> CmdResult<u32> {
+    Ok(view::count_entries(
+        state.service.store(),
+        &selection,
+        unread_only,
+        query.as_deref(),
     )?)
 }
 
@@ -55,11 +72,16 @@ pub async fn set_starred(
 }
 
 #[tauri::command]
-pub async fn mark_all_read(state: State<'_, AppState>, selection: Selection) -> CmdResult<usize> {
-    Ok(state
-        .service
-        .store()
-        .mark_all_read(&selection.filter(false))?)
+pub async fn mark_all_read(
+    state: State<'_, AppState>,
+    selection: Selection,
+    query: Option<String>,
+) -> CmdResult<usize> {
+    Ok(view::mark_all_read(
+        state.service.store(),
+        &selection,
+        query.as_deref(),
+    )?)
 }
 
 #[tauri::command]

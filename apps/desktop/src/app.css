@@ -10,6 +10,8 @@
   --border: #e2e0dc;
   --accent: #e8822a;
   --error: #c0392b;
+  --mark: #ffe28a;
+  --mark-selected: rgba(255, 255, 255, 0.35);
   font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif;
   font-size: 14px;
 }
@@ -24,6 +26,7 @@
     --fg-muted: #9a9a9a;
     --border: #383838;
     --error: #ff6b5b;
+    --mark: #6e5516;
   }
 }
 

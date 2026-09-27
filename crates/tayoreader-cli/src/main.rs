@@ -48,6 +48,9 @@ enum Command {
         folder: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// タイトル・本文を検索する（空白で区切った語をすべて含む記事）
+        #[arg(long, value_name = "QUERY")]
+        search: Option<String>,
     },
     /// 既読にする
     Read {
@@ -144,6 +147,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             feed,
             folder,
             limit,
+            search,
         } => {
             let filter = EntryFilter {
                 unread_only: unread,
@@ -152,6 +156,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 folder,
                 limit: Some(limit),
                 offset: None,
+                query: search,
             };
             for entry in store.list_entries(&filter)? {
                 print_entry(&entry);

@@ -156,6 +156,53 @@ async fn import_opml_then_refresh_reports_failures() {
         ));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn entries_search_filters_by_words() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/feed.xml"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RSS))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("tayoreader.db");
+    tayoreader(&db)
+        .args(["add", &format!("{}/feed.xml", server.uri())])
+        .assert()
+        .success();
+
+    tayoreader(&db)
+        .args(["entries", "--search", "SECOND"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Second post")
+                .and(predicate::str::contains("First post").not()),
+        );
+    // 語はすべて含む記事だけ。ほかのオプションと併用できる
+    tayoreader(&db)
+        .args(["entries", "--unread", "--search", "summary first"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("First post")
+                .and(predicate::str::contains("Second post").not()),
+        );
+    tayoreader(&db)
+        .args(["entries", "--search", "nothing-matches"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+    // 空白だけなら検索しない
+    tayoreader(&db)
+        .args(["entries", "--search", "　"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("First post").and(predicate::str::contains("Second post")),
+        );
+}
+
 #[test]
 fn add_rejects_blank_folder_without_fetching() {
     let dir = tempfile::tempdir().unwrap();

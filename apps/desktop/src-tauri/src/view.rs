@@ -282,20 +282,44 @@ fn folder_names<'a>(feeds: impl Iterator<Item = &'a Feed>) -> BTreeSet<String> {
     feeds.flat_map(|f| f.folders.iter().cloned()).collect()
 }
 
-/// 記事一覧を返す。
+/// 記事一覧を返す。`query` があれば検索結果だけにする。
 pub fn list_entries(
     store: &Store,
     selection: &Selection,
     unread_only: bool,
+    query: Option<&str>,
     offset: u32,
     limit: u32,
 ) -> Result<Vec<EntrySummary>> {
     let filter = EntryFilter {
         offset: Some(offset),
         limit: Some(limit),
-        ..selection.filter(unread_only)
+        ..search_filter(selection, unread_only, query)
     };
     Ok(store.list_entries(&filter)?.iter().map(summarize).collect())
+}
+
+/// 一覧に出る記事の件数を返す（検索結果の件数に使う）。
+pub fn count_entries(
+    store: &Store,
+    selection: &Selection,
+    unread_only: bool,
+    query: Option<&str>,
+) -> Result<u32> {
+    store.count_entries(&search_filter(selection, unread_only, query))
+}
+
+/// 選択中の記事をすべて既読にする。`query` があれば検索結果だけにする。
+/// 「未読のみ」の切り替えに関わらず、選択中の記事すべてを対象にする。
+pub fn mark_all_read(store: &Store, selection: &Selection, query: Option<&str>) -> Result<usize> {
+    store.mark_all_read(&search_filter(selection, false, query))
+}
+
+fn search_filter(selection: &Selection, unread_only: bool, query: Option<&str>) -> EntryFilter {
+    EntryFilter {
+        query: query.map(str::to_owned),
+        ..selection.filter(unread_only)
+    }
 }
 
 pub fn summarize(entry: &Entry) -> EntrySummary {
@@ -556,7 +580,7 @@ mod tests {
         };
         save(&s, a, &[first, untitled]);
 
-        let page = list_entries(&s, &Selection::All, true, 0, 1).unwrap();
+        let page = list_entries(&s, &Selection::All, true, None, 0, 1).unwrap();
         assert_eq!(page.len(), 1);
         // 公開日時の無い記事は取得日時（100）で並ぶので先頭に来る
         let e = &page[0];
@@ -565,7 +589,7 @@ mod tests {
         assert_eq!(e.feed_title, "A");
         assert_eq!(e.snippet, "");
 
-        let next = list_entries(&s, &Selection::All, true, 1, 1).unwrap();
+        let next = list_entries(&s, &Selection::All, true, None, 1, 1).unwrap();
         assert_eq!(next[0].title, "title a1");
         assert_eq!(next[0].snippet, "Hello & world");
         assert_eq!(next[0].published_at, 50);
@@ -637,8 +661,76 @@ mod tests {
         save(&s, a, &[entry("empty", Some(1))]);
         let id = s.list_entries(&EntryFilter::default()).unwrap()[0].id;
         assert_eq!(get_article(&s, id).unwrap().html, "");
-        let summary = &list_entries(&s, &Selection::All, false, 0, 10).unwrap()[0];
+        let summary = &list_entries(&s, &Selection::All, false, None, 0, 10).unwrap()[0];
         assert_eq!(summary.snippet, "");
+    }
+
+    // ---- 検索 ----
+
+    /// フィード a（フォルダ Tech）に「台風情報」「天気予報」、b に「台風の進路」。
+    fn search_store() -> (Store, i64, i64) {
+        let s = store();
+        let a = feed(&s, "https://a.example/", Some("A"), &["Tech"]);
+        let b = feed(&s, "https://b.example/", Some("B"), &[]);
+        let titled = |guid: &str, title: &str, published_at| NewEntry {
+            guid: guid.into(),
+            title: Some(title.into()),
+            summary: Some(format!("<p>{title}の本文</p>")),
+            published_at: Some(published_at),
+            ..Default::default()
+        };
+        save(
+            &s,
+            a,
+            &[titled("a1", "台風情報", 3), titled("a2", "天気予報", 2)],
+        );
+        save(&s, b, &[titled("b1", "台風の進路", 1)]);
+        (s, a, b)
+    }
+
+    fn titles(entries: &[EntrySummary]) -> Vec<&str> {
+        entries.iter().map(|e| e.title.as_str()).collect()
+    }
+
+    #[test]
+    fn list_entries_passes_query_within_selection() {
+        let (s, a, _) = search_store();
+        let all = list_entries(&s, &Selection::All, true, Some("台風"), 0, 10).unwrap();
+        assert_eq!(titles(&all), vec!["台風情報", "台風の進路"]);
+        let in_feed =
+            list_entries(&s, &Selection::Feed { id: a }, true, Some("台風"), 0, 10).unwrap();
+        assert_eq!(titles(&in_feed), vec!["台風情報"]);
+        let paged = list_entries(&s, &Selection::All, true, Some("台風"), 1, 10).unwrap();
+        assert_eq!(titles(&paged), vec!["台風の進路"]);
+        let no_query = list_entries(&s, &Selection::All, true, None, 0, 10).unwrap();
+        assert_eq!(no_query.len(), 3);
+    }
+
+    #[test]
+    fn count_entries_counts_search_results() {
+        let (s, _, _) = search_store();
+        let folder = Selection::Folder {
+            name: "Tech".into(),
+        };
+        assert_eq!(
+            count_entries(&s, &Selection::All, true, Some("台風")).unwrap(),
+            2
+        );
+        assert_eq!(count_entries(&s, &folder, true, Some("台風")).unwrap(), 1);
+        assert_eq!(
+            count_entries(&s, &Selection::All, true, Some("存在しない")).unwrap(),
+            0
+        );
+        assert_eq!(count_entries(&s, &Selection::All, true, None).unwrap(), 3);
+    }
+
+    #[test]
+    fn mark_all_read_with_query_marks_only_search_results() {
+        let (s, _, _) = search_store();
+        assert_eq!(mark_all_read(&s, &Selection::All, Some("台風")).unwrap(), 2);
+        let unread = list_entries(&s, &Selection::All, true, None, 0, 10).unwrap();
+        assert_eq!(titles(&unread), vec!["天気予報"]);
+        assert_eq!(mark_all_read(&s, &Selection::All, None).unwrap(), 1);
     }
 
     // ---- 結果とエラーの変換 ----

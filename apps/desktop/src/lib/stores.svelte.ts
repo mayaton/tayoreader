@@ -15,6 +15,8 @@ import {
 export const PAGE_SIZE = 200;
 // 自動更新の間隔。
 export const AUTO_REFRESH_MINUTES = 30;
+// 検索欄の入力が止まってから検索するまでの時間。
+export const SEARCH_DEBOUNCE_MS = 250;
 const TOAST_MS = { info: 4_000, error: 10_000 } as const;
 
 export type Toast = { id: number; kind: "info" | "error"; message: string };
@@ -90,6 +92,19 @@ export function adjustUnread(view: SidebarView, feedId: number, delta: number): 
   if (found) view.totalUnread = bump(view.totalUnread);
 }
 
+// 検索中に一覧ヘッダの名前の下へ出す説明。件数がまだ無ければ件数を省く。
+export function searchSummary(query: string, count: number | null): string {
+  return count === null ? `"${query}" の検索結果` : `"${query}" の検索結果（${count} 件）`;
+}
+
+// 「すべて既読」の確認ダイアログの文言。検索中は検索結果だけが対象になる。
+export function markAllReadMessage(query: string, count: number | null): string {
+  if (query === "") return "表示中の記事をすべて既読にしますか？";
+  return count === null
+    ? "検索結果をすべて既読にしますか？"
+    : `検索結果の ${count} 件をすべて既読にしますか？`;
+}
+
 export function refreshMessage(summary: RefreshSummary): string {
   const failed = summary.failed.length;
   return failed > 0
@@ -111,6 +126,12 @@ export class Reader {
   sidebar = $state<SidebarView | null>(null);
   selection = $state<Selection>({ kind: "all" });
   unreadOnly = $state(true);
+  // 検索に使っている語（前後の空白を除いたもの）。空なら検索しない。
+  query = $state("");
+  // 検索欄の入力。入力が止まってから query に反映する。
+  searchText = $state("");
+  // 検索結果の件数。検索していないときと、取得するまでは null。
+  searchCount = $state<number | null>(null);
   entries = $state<EntrySummary[]>([]);
   hasMore = $state(false);
   selectedId = $state<number | null>(null);
@@ -124,6 +145,7 @@ export class Reader {
   #api: Api;
   #nextToastId = 1;
   #loadingMore = false;
+  #searchTimer: ReturnType<typeof setTimeout> | undefined;
   // 一覧を読み直すたびに増やし、古い応答で上書きしないようにする。
   #listVersion = 0;
 
@@ -157,6 +179,28 @@ export class Reader {
     await this.reloadEntries();
   }
 
+  // 検索欄の入力を受け取り、入力が止まってから検索する。
+  setSearchText(text: string): void {
+    this.searchText = text;
+    clearTimeout(this.#searchTimer);
+    this.#searchTimer = setTimeout(() => void this.applySearch(), SEARCH_DEBOUNCE_MS);
+  }
+
+  // 入力が止まるのを待たずに検索する。語が変わっていなければ読み直さない。
+  async applySearch(): Promise<void> {
+    clearTimeout(this.#searchTimer);
+    const query = this.searchText.trim();
+    if (query === this.query) return;
+    this.query = query;
+    await this.reloadEntries();
+  }
+
+  // 検索を解除して一覧を読み直す。
+  async clearSearch(): Promise<void> {
+    this.searchText = "";
+    await this.applySearch();
+  }
+
   // 一覧を先頭から読み直す。選択は外し、先頭の記事も自動では選ばない。
   async reloadEntries(): Promise<void> {
     const version = ++this.#listVersion;
@@ -164,11 +208,16 @@ export class Reader {
     this.hasMore = false;
     this.selectedId = null;
     this.article = null;
+    this.searchCount = null;
     try {
-      const page = await this.#api.listEntries(this.selection, this.unreadOnly, 0, PAGE_SIZE);
+      const [page, count] = await Promise.all([
+        this.#api.listEntries(this.selection, this.unreadOnly, this.#queryArg(), 0, PAGE_SIZE),
+        this.#countSearch(),
+      ]);
       if (version !== this.#listVersion) return;
       this.entries = page;
       this.hasMore = page.length === PAGE_SIZE;
+      this.searchCount = count;
     } catch (e) {
       this.#error(e);
     }
@@ -182,7 +231,13 @@ export class Reader {
     const version = this.#listVersion;
     try {
       const offset = this.entries.filter((e) => this.#matches(e)).length;
-      const page = await this.#api.listEntries(this.selection, this.unreadOnly, offset, PAGE_SIZE);
+      const page = await this.#api.listEntries(
+        this.selection,
+        this.unreadOnly,
+        this.#queryArg(),
+        offset,
+        PAGE_SIZE,
+      );
       if (version !== this.#listVersion) return;
       const known = new Set(this.entries.map((e) => e.id));
       this.entries.push(...page.filter((e) => !known.has(e.id)));
@@ -256,7 +311,7 @@ export class Reader {
     }
   }
 
-  // 表示中の一覧をすべて既読にする（一覧からは消さない）。
+  // 表示中の一覧をすべて既読にする（一覧からは消さない）。検索中は検索結果だけを既読にする。
   // 更新中は、取り込み中の新着まで既読にしてしまうため実行しない。
   async markAllRead(): Promise<void> {
     if (this.refreshing) {
@@ -264,7 +319,7 @@ export class Reader {
       return;
     }
     try {
-      await this.#api.markAllRead(this.selection);
+      await this.#api.markAllRead(this.selection, this.#queryArg());
       this.entries.forEach((e) => (e.isRead = true));
       if (this.article) this.article.isRead = true;
       await this.loadSidebar();
@@ -375,13 +430,29 @@ export class Reader {
     await this.loadSidebar();
     const version = ++this.#listVersion;
     const limit = Math.max(PAGE_SIZE, this.entries.length);
-    const page = await this.#api.listEntries(this.selection, this.unreadOnly, 0, limit);
+    const [page, count] = await Promise.all([
+      this.#api.listEntries(this.selection, this.unreadOnly, this.#queryArg(), 0, limit),
+      this.#countSearch(),
+    ]);
     if (version !== this.#listVersion) return;
     const hasMore = page.length === limit;
     const selected = this.selectedEntry;
     if (selected && !page.some((e) => e.id === selected.id)) insertSorted(page, selected);
     this.entries = page;
     this.hasMore = hasMore;
+    this.searchCount = count;
+  }
+
+  // コマンドに渡す検索語。検索していなければ null。
+  #queryArg(): string | null {
+    return this.query === "" ? null : this.query;
+  }
+
+  // 検索中なら、いまの絞り込みでの検索結果の件数を返す。
+  async #countSearch(): Promise<number | null> {
+    const query = this.#queryArg();
+    if (query === null) return null;
+    return this.#api.countEntries(this.selection, this.unreadOnly, query);
   }
 
   #applyRead(id: number, read: boolean): void {

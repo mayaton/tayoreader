@@ -28,6 +28,7 @@ tayoreader add https://blog.rust-lang.org/feed.xml --folder Rust
 tayoreader import-opml ~/Downloads/inoreader.opml
 tayoreader refresh
 tayoreader entries --unread
+tayoreader entries --search "台風 情報"      # タイトル・本文を検索（語はすべて含む）
 tayoreader read 1 2 3
 ```
 
@@ -47,7 +48,10 @@ DB は既定で OS のアプリデータディレクトリ（macOS では `~/Lib
 | `u` | 未読のみ / すべて |
 | `r` | 更新 |
 | `a` | 購読を追加 |
-| `Shift+A` | 表示中の一覧をすべて既読 |
+| `Shift+A` | 表示中の一覧をすべて既読（検索中は検索結果だけ） |
+| `/` | 記事を検索（タイトル・本文。空白で区切った語をすべて含む記事） |
+| `Enter`（検索欄） | すぐに検索して一覧の操作に戻る |
+| `Esc`（検索欄） | 検索を解除して一覧の操作に戻る |
 | `Esc` | ダイアログを閉じる |
 | `Cmd+Shift+O` | OPML を読み込む |
 

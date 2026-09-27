@@ -44,6 +44,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::sidebar,
             commands::list_entries,
+            commands::count_entries,
             commands::get_article,
             commands::set_read,
             commands::set_starred,

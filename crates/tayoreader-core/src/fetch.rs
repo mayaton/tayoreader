@@ -102,7 +102,7 @@ pub fn parse_feed(body: &[u8]) -> Result<(FeedMeta, Vec<NewEntry>)> {
             let published_at = e.published.or(e.updated).map(|d| d.timestamp());
             NewEntry {
                 guid: entry_guid(&e.id, url.as_deref(), title.as_deref(), published_at),
-                author: e.authors.first().map(|p| p.name.clone()),
+                author: e.authors.first().and_then(|p| p.name.clone()),
                 summary: e.summary.map(|t| t.content),
                 content: e.content.and_then(|c| c.body),
                 url,

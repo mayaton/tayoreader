@@ -20,8 +20,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       # ビルド成果物をタグごとに配布するため、キャッシュ汚染を避けて毎回クリーンビルドする
       - run: cargo build --release -p tayoreader-cli --locked --target ${{ matrix.target }}

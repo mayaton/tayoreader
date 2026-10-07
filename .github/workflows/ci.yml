@@ -71,3 +71,5 @@ jobs:
       - run: pnpm build
       - run: cargo clippy -p tayoreader-desktop --all-targets -- -D warnings
       - run: cargo test -p tayoreader-desktop
+      # tauri crate と @tauri-apps/* の minor 不一致を検出する。pnpm tauri info は不一致でも exit 0 になるため build を使う
+      - run: pnpm tauri build --debug --no-bundle
